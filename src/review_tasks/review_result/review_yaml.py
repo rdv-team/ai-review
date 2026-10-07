@@ -406,10 +406,12 @@ def render_review_report(
 ) -> str:
     source_links = _load_source_links_for_documents(documents)
     summary = _render_summary(documents)
-    issue_sections = {
-        severity: _render_issues(documents, severity, source_links)
-        for severity in ("critical", "important", "desirable")
-    }
+    issue_sections: dict[str, str] = {}
+    next_number = 1
+    for severity in ("critical", "important", "desirable"):
+        issue_sections[severity], next_number = _render_issues(
+            documents, severity, source_links, next_number
+        )
     questions = _render_string_list(
         [item for doc in documents for item in doc.parsed.questions_to_author],
         empty="_Нет вопросов._",
@@ -519,26 +521,29 @@ def _finding_heading(
     document: ReviewYamlDocument,
     finding: object,
     source_links: dict[Path, dict[str, SourceLink]],
+    number: int,
 ) -> str:
     file = finding.file
     start_line = finding.start_line
     end_line = finding.end_line
     label = f"{file}:{start_line}-{end_line}"
+    prefix = f"### №{number} — "
     entry = source_links.get(document.source.parent, {}).get(_normalize_finding_path(file))
     if entry is None:
-        return f"### {label}"
+        return f"{prefix}{label}"
     project_url, target, source_path = entry
     destination = build_gitlab_blob_url(project_url, target, source_path, start_line, end_line)
     if destination is None:
-        return f"### {label}"
-    return f"### [{_escape_markdown_link_label(label)}]({destination})"
+        return f"{prefix}{label}"
+    return f"{prefix}[{_escape_markdown_link_label(label)}]({destination})"
 
 
 def _render_issues(
     documents: list[ReviewYamlDocument],
     severity: str,
     source_links: dict[Path, dict[str, SourceLink]],
-) -> str:
+    next_number: int,
+) -> tuple[str, int]:
     blocks: list[str] = []
     for doc in documents:
         for finding in doc.parsed.findings:
@@ -546,14 +551,15 @@ def _render_issues(
                 continue
             if finding.severity != severity:
                 continue
-            header = _finding_heading(doc, finding, source_links)
+            header = _finding_heading(doc, finding, source_links, next_number)
             body = [header]
             body.append(f"- **Риск**: {SEVERITY_TITLES[severity].lower()}")
             body.append(f"- **Суть**: {finding.observation}")
             if finding.suggestion:
                 body.extend(_render_suggestion_markdown(finding.suggestion))
             blocks.append("\n".join(body))
-    return "\n\n".join(blocks) if blocks else "_Нет замечаний._"
+            next_number += 1
+    return ("\n\n".join(blocks) if blocks else "_Нет замечаний._"), next_number
 
 
 def _render_string_list(items: list[str], *, empty: str) -> str:

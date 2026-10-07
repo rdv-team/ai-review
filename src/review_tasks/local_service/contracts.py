@@ -174,7 +174,7 @@ def package_version() -> str:
     try:
         return version("review-tasks")
     except PackageNotFoundError:
-        return "1.1.0"
+        return "1.1.1"
 
 
 def now_iso() -> str:

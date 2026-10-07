@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "review-tasks"
-version = "1.1.0"
+version = "1.1.1"
 description = "RDV AIR — AI Review: подготовка самодостаточного каталога для code review задач 1С из git-коммитов."
 requires-python = ">=3.11"
 dependencies = [
