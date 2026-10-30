@@ -10,6 +10,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from review_tasks.review_init.comparison import ComparisonSummary
+
 
 INIT_RESULT_SCHEMA_VERSION = 1
 InitOutcome = Literal["success", "expected_stop", "failure"]
@@ -49,7 +51,19 @@ class InitResultEnvelope(BaseModel):
         return self
 
 
-def write_init_result(path: Path, result: InitResultEnvelope) -> None:
+class InitResultEnvelopeV2(InitResultEnvelope):
+    schema_version: Literal[2] = Field(default=2, alias="schemaVersion")
+    comparisons: list[ComparisonSummary]
+
+
+def parse_init_result(payload: dict) -> InitResultEnvelope | InitResultEnvelopeV2:
+    if not isinstance(payload, dict):
+        raise ValueError("init result must be a JSON object")
+    model = InitResultEnvelopeV2 if payload.get("schemaVersion") == 2 else InitResultEnvelope
+    return model.model_validate(payload)
+
+
+def write_init_result(path: Path, result: InitResultEnvelope | InitResultEnvelopeV2) -> None:
     """Atomically write UTF-8 JSON with LF line endings."""
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(

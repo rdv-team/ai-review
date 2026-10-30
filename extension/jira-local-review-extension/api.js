@@ -109,6 +109,14 @@
       return this.request(`/reviews/${encodeURIComponent(jobId)}/open-agent-log`, { method: "POST" });
     }
 
+    openReviewBsl(jobId) {
+      return this.request(`/reviews/${encodeURIComponent(jobId)}/open-review-bsl`, { method: "POST" });
+    }
+
+    openChanges(jobId) {
+      return this.request(`/reviews/${encodeURIComponent(jobId)}/open-changes`, { method: "POST" });
+    }
+
     openJobLog(jobId, logRef) {
       return this.request(`/reviews/${encodeURIComponent(jobId)}/open-log`, {
         method: "POST",

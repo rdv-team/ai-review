@@ -377,6 +377,15 @@ class JobOrchestrator:
                 )
                 return
 
+            comparisons = getattr(init_contract, "comparisons", [])
+            expected_dir = Path(str(resolved_init["reviewsRoot"])) / str(resolved_init.get("reviewDirName") or request["issueKey"])
+            matching = [item for item in comparisons if item.task == request["issueKey"]
+                        and Path(item.task_dir).resolve() == expected_dir.resolve()]
+            if len(matching) == 1:
+                comparison = matching[0]
+                self.store.update_status(job_id, comparison=comparison.model_dump(by_alias=True),
+                                         taskDir=comparison.task_dir)
+
             if init_contract.outcome == "expected_stop":
                 init_outcome = init_contract.code
                 if init_contract.code == "already_done":
@@ -913,7 +922,7 @@ class JobOrchestrator:
             status="review_running",
             detailStatus="review_running",
             detailText=DETAIL_TEXT["review_running"],
-            availableActions=["cancel", "open_agent_log"],
+            availableActions=["cancel", "open_agent_log", "open_review_bsl"],
         )
         started = time.monotonic()
         try:
@@ -978,7 +987,7 @@ class JobOrchestrator:
             status="review_running",
             detailStatus="review_running",
             detailText=DETAIL_TEXT["review_running"],
-            availableActions=["cancel", "open_agent_log"],
+            availableActions=["cancel", "open_agent_log", "open_review_bsl"],
         )
         started = time.monotonic()
         try:
@@ -1050,7 +1059,7 @@ class JobOrchestrator:
             status="review_running",
             detailStatus="review_running",
             detailText=DETAIL_TEXT["review_running"],
-            availableActions=["cancel", "open_agent_log"],
+            availableActions=["cancel", "open_agent_log", "open_review_bsl"],
         )
         started = time.monotonic()
         try:
@@ -1161,7 +1170,7 @@ class JobOrchestrator:
             status="done",
             detailStatus="done",
             detailText=DETAIL_TEXT["done"],
-            availableActions=["open_report", "open_reasoning", "open_agent_log", "refresh"],
+            availableActions=["open_report", "open_reasoning", "open_agent_log", "open_review_bsl", "refresh"],
             finishedAt=now_iso(),
             reportPath=str(report_path),
             reasoningPath=str(yaml_paths[0]),
@@ -1428,7 +1437,7 @@ def build_init_argv(
     if request.get("userInstruction") is not None:
         argv.extend(["--user-instruction", str(request["userInstruction"])])
     if result_path is not None:
-        argv.extend(["--result-path", str(result_path)])
+        argv.extend(["--result-path", str(result_path), "--result-schema-version", "2"])
     return argv
 
 

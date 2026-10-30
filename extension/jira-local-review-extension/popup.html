@@ -22,10 +22,13 @@
       <section class="status-band" id="statusBand">
         <div class="status-main">
           <div id="displayStatus" class="display-status">Новая</div>
-          <button id="openAgentLog" type="button" class="agent-log-button" title="Открыть лог агента" aria-label="Открыть лог агента" hidden>↗</button>
+          <div id="detailStatus" class="detail-status">Ожидание</div>
+          <div id="duration" class="duration"></div>
         </div>
-        <div id="detailStatus" class="detail-status">Ожидание</div>
-        <div id="duration" class="duration"></div>
+        <div class="status-actions">
+          <button id="openAgentLog" type="button" class="agent-log-button log-file-button" title="Открыть лог агента" aria-label="Открыть лог агента" hidden></button>
+          <button id="openChanges" type="button" class="agent-log-button code-button" title="Открыть изменения" aria-label="Открыть изменения" hidden>&lt;/&gt;</button>
+        </div>
       </section>
 
       <section class="state-details" id="stateDetails">

@@ -64,18 +64,32 @@ body {
 }
 
 .status-band {
+  align-items: center;
   background: #ffffff;
   border: 1px solid #b8d9e1;
   border-left: 4px solid var(--brand-cyan);
   border-radius: 7px;
+  display: flex;
+  gap: 12px;
   padding: 10px;
 }
 
 .status-main {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.status-actions {
   align-items: center;
   display: flex;
-  gap: 8px;
-  justify-content: space-between;
+  flex: 0 0 auto;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.status-actions:not(:has(> :not([hidden]))) {
+  display: none;
 }
 
 .agent-log-button {
@@ -103,6 +117,21 @@ body {
 .agent-log-button:focus-visible {
   outline: 2px solid var(--brand-cyan);
   outline-offset: 2px;
+}
+
+.log-file-button:not(.action-done):not(.action-failed)::before {
+  background-color: currentColor;
+  content: "";
+  height: 17px;
+  -webkit-mask: url("icons/agent-log.svg") center / contain no-repeat;
+  mask: url("icons/agent-log.svg") center / contain no-repeat;
+  width: 17px;
+}
+
+.code-button {
+  font-family: Consolas, monospace;
+  font-size: 12px;
+  font-weight: 600;
 }
 
 .display-status {

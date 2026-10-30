@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import threading
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Callable
 
 from review_tasks.review_init import prefix_config
+from review_tasks.review_init.comparison import (
+    COMPARISON_LAUNCHER, ComparisonLaunchError, launch_comparison,
+)
 from review_tasks.review_result.review_yaml import expand_review_result_inputs, read_review_yaml_documents
 
 from .contracts import (
@@ -76,6 +80,7 @@ class LocalReviewService:
         effective_config: EffectiveServiceConfig | None = None,
         gitlab_client: GitLabApiClient | None = None,
         file_opener: Callable[[Path], None] | None = None,
+        changes_runner: Callable[[Path], None] | None = None,
     ) -> None:
         if effective_config is None and service_root is not None:
             candidate_config = Path(service_root).expanduser().resolve() / SERVICE_CONFIG_FILENAME
@@ -95,6 +100,7 @@ class LocalReviewService:
         self.drain_timeout_sec = max(0, drain_timeout_sec)
         self.gitlab_client = gitlab_client or GitLabApiClient()
         self.file_opener = file_opener or open_text_file
+        self.changes_runner = changes_runner or launch_comparison
         gitlab_instances = effective_config.gitlab_instances if effective_config is not None else ()
         self.orchestrator = JobOrchestrator(
             self.store,
@@ -333,14 +339,14 @@ class LocalReviewService:
             return exc.status, api_error_response(exc)
         status = self.store.find_latest_by_issue(normalized)
         status = self._project_issue_status(status)
-        return 200, {"ok": True, "status": status_to_popup(status, issue_key=normalized)}
+        return 200, {"ok": True, "status": status_to_popup(self._with_changes_action(status), issue_key=normalized)}
 
     def get_status(self, job_id: str) -> tuple[int, dict[str, Any]]:
         status = self.store.read_status(job_id)
         if status is None:
             return 404, structured_error("not_found", f"Unknown jobId: {job_id}")
         status = self._enrich_completed_status(status)
-        return 200, {"ok": True, "status": status_to_popup(status)}
+        return 200, {"ok": True, "status": status_to_popup(self._with_changes_action(status))}
 
     def get_summary(self, job_id: str) -> tuple[int, dict[str, Any]]:
         status = self.store.read_status(job_id)
@@ -420,6 +426,70 @@ class LocalReviewService:
             self.file_opener(log_path)
         except Exception:
             return 500, structured_error("agent_log_open_failed", "The operating system could not open the agent log.")
+        return 200, {"ok": True, "jobId": job_id}
+
+    def _with_changes_action(self, status: dict[str, Any] | None) -> dict[str, Any] | None:
+        if status is None:
+            return None
+        projected = dict(status)
+        raw_actions = projected.get("availableActions")
+        actions = [a for a in raw_actions if a != "open_changes"] if isinstance(raw_actions, list) else []
+        projected["availableActions"] = actions
+        if sys.platform != "win32":
+            return projected
+        task_dir = projected.get("taskDir")
+        if task_dir and (Path(task_dir) / "_review_info" / "changes" / COMPARISON_LAUNCHER).is_file():
+            actions.append("open_changes")
+        return projected
+
+    def open_changes(self, job_id: str) -> tuple[int, dict[str, Any]]:
+        status = self.store.read_status(job_id)
+        if status is None:
+            return 404, structured_error("not_found", f"Unknown jobId: {job_id}")
+        if sys.platform != "win32":
+            return 501, structured_error("changes_platform_unsupported", "Запуск сравнения доступен в Windows.")
+        task_dir = status.get("taskDir")
+        if not task_dir:
+            return 409, structured_error("changes_inactive", "Каталог задачи не определён.")
+        script = Path(task_dir) / "_review_info" / "changes" / COMPARISON_LAUNCHER
+        if not script.is_file():
+            return 404, structured_error("changes_unavailable", "Launcher сравнения отсутствует.")
+        try:
+            self.changes_runner(script)
+        except ComparisonLaunchError as exc:
+            code = 424 if exc.code == "changes_tool_missing" else 500
+            return code, structured_error(exc.code, str(exc))
+        except Exception:
+            return 500, structured_error("changes_open_failed", "Не удалось открыть сравнение.")
+        return 200, {"ok": True, "jobId": job_id}
+
+    def open_review_bsl(self, job_id: str) -> tuple[int, dict[str, Any]]:
+        status = self.store.read_status(job_id)
+        if status is None:
+            return 404, structured_error("not_found", f"Unknown jobId: {job_id}")
+        available_actions = status.get("availableActions")
+        if (
+            status.get("detailStatus") not in {"review_running", "done"}
+            or not isinstance(available_actions, list)
+            or "open_review_bsl" not in available_actions
+        ):
+            return 409, structured_error(
+                "review_bsl_inactive",
+                "Review BSL file is not available for this review status.",
+            )
+        task_dir_value = status.get("taskDir")
+        if not isinstance(task_dir_value, str) or not task_dir_value.strip():
+            return 404, structured_error("review_bsl_unavailable", "Persisted task directory is unavailable.")
+        try:
+            review_path = (Path(task_dir_value).expanduser() / "_review_info" / "review_bsl.md").resolve()
+            if not review_path.is_file():
+                return 404, structured_error("review_bsl_unavailable", "Review BSL file is unavailable.")
+        except (OSError, ValueError, RuntimeError):
+            return 404, structured_error("review_bsl_unavailable", "Persisted review BSL path is unavailable.")
+        try:
+            self.file_opener(review_path)
+        except Exception:
+            return 500, structured_error("review_bsl_open_failed", "The operating system could not open the review BSL file.")
         return 200, {"ok": True, "jobId": job_id}
 
     def open_job_log(self, job_id: str, payload: Any) -> tuple[int, dict[str, Any]]:

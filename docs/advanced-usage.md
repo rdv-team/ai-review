@@ -23,9 +23,29 @@ TASK-123/
    ├─ meta.txt
    ├─ review_bsl.md
    ├─ review_lines.json
+   ├─ changes/
+   │  ├─ before/
+   │  ├─ after/
+   │  └─ open-changes.cmd
    ├─ review_prompt_stage1.md
    └─ review_prompt_stage2.md
 ```
+
+### Полные изменения во внешнем diff-инструменте
+
+После `init` в `_review_info/changes` доступны полные файлы для сравнения: выделены сохранившиеся изменения задачи или MR, посторонние правки остаются контекстом.
+
+В Windows запустите `_review_info/changes/open-changes.cmd`. По умолчанию нужен установленный KDiff3; также поддерживаются Meld и WinMerge. Каталоги `before` и `after` можно открыть вручную в другом инструменте сравнения.
+
+Чтобы выбрать приложение, добавьте в `.review-tasks.toml` проверяемого репозитория или файл, переданный через `--config`:
+
+```toml
+[diff_viewer]
+tool = "meld" # kdiff3 | meld | winmerge
+executable = '' # пусто — поиск выбранного приложения
+```
+
+Для нестандартной установки укажите путь к `.exe`, например `executable = 'C:\Program Files\Meld\Meld.exe'`. После изменения настроек повторите `init`, при необходимости с `--force`.
 
 ## Два skill основного маршрута
 

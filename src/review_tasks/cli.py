@@ -51,6 +51,12 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 from .adapters import IDE_CHOICES, IdeAdapterError, get_adapter
+from .review_init.comparison import ComparisonSource, ComparisonSummary, task_lock, write_comparison
+from .review_init.task_scope import (
+    BLAME_HEADER_RE, HUNK_HEADER_RE, BlameLine, DiffHunk, DiffLine, NetOldEntry, NetOldLineState, PromptLine,
+    apply_net_old_hunks as replay_task_hunks,
+    build_net_old_hunk_segment, hunk_old_index, parse_final_blame, parse_unified_diff_hunks,
+)
 from .infrastructure.git import (
     ToolError,
     _run,
@@ -75,7 +81,7 @@ from .reference_catalog import ReferenceCatalogError, write_reference_catalog
 from .review_init import prefix_config
 from .review_init.agent_skills import SkillProjectionError, project_agent_skills
 from .review_init.prompt_config import ConfigError, EffectiveConfig, ReviewPromptConfig, load_effective_config
-from .review_init.result import InitResultContext, InitResultEnvelope, write_init_result
+from .review_init.result import InitResultContext, InitResultEnvelope, InitResultEnvelopeV2, write_init_result
 from .review_result.review_yaml import (
     ReviewYamlError,
     expand_review_result_inputs,
@@ -126,6 +132,7 @@ class InitResultRecorder:
     code: str | None = None
     message: str | None = None
     review_dirs: list[Path] = field(default_factory=list)
+    comparisons: list[ComparisonSummary] = field(default_factory=list)
 
     def record_expected_stop(self, code: str, message: str, task_dir: Path) -> None:
         if self.outcome == "expected_stop":
@@ -139,7 +146,7 @@ class InitResultRecorder:
         if review_dir not in self.review_dirs:
             self.review_dirs.append(review_dir)
 
-    def envelope(self, exit_code: int) -> InitResultEnvelope:
+    def envelope(self, exit_code: int, schema_version: int = 1) -> InitResultEnvelope:
         if self.outcome == "expected_stop" and self.code and self.message:
             outcome = "expected_stop"
             code = self.code
@@ -159,7 +166,10 @@ class InitResultRecorder:
                 EXIT_NO_PATHS: "Не найдены поддерживаемые изменения для ревью.",
             }.get(exit_code, "Не удалось подготовить каталог ревью.")
         task_dir = self.review_dirs[0] if len(self.review_dirs) == 1 else None
-        return InitResultEnvelope(
+        model = InitResultEnvelopeV2 if schema_version == 2 else InitResultEnvelope
+        extra = {"comparisons": self.comparisons} if schema_version == 2 else {}
+        return model(
+            **extra,
             outcome=outcome,
             code=code,
             message=message,
@@ -177,7 +187,6 @@ METHOD_START_RE = re.compile(
     r"([A-Za-zА-Яа-яЁё_][A-Za-zА-Яа-яЁё0-9_]*)\s*\(",
     re.UNICODE | re.IGNORECASE,
 )
-BLAME_HEADER_RE = re.compile(r"^([0-9a-f]{40}) (\d+) (\d+)(?: (\d+))?$")
 COMPLETED_STATUS_RE = re.compile(r"(?im)^\s*status\s*[:=]\s*completed\s*$")
 
 
@@ -282,6 +291,13 @@ class SourceResolution:
     mr_id: int | None = None
     mr_ref: str | None = None
     review_dir_name: str | None = None
+
+    def comparison_source(self, repository: Path) -> ComparisonSource:
+        """Adapt the same resolved TASK/MR commits used by AI material."""
+        base = self.base
+        if self.source_kind == "task" and base == self.commits[-1].sha:
+            base = None
+        return ComparisonSource(repository, base, self.target, frozenset(self.task_shas))
 
 
 @dataclass(frozen=True)
@@ -863,46 +879,6 @@ def is_report_template(path: str) -> bool:
 # Review prompt: BSL-блоки, token budget, split
 # ---------------------------------------------------------------------------
 
-HUNK_HEADER_RE = re.compile(
-    r"^@@ -(?P<old_start>\d+)(?:,(?P<old_count>\d+))? "
-    r"\+(?P<new_start>\d+)(?:,(?P<new_count>\d+))? @@(?P<context>.*)$"
-)
-
-
-@dataclass
-class PromptLine:
-    sign: str
-    text: str
-    target_line: int | None = None
-
-
-@dataclass(frozen=True)
-class BlameLine:
-    sha: str
-    source_line: int
-    target_line: int
-    text: str
-
-
-@dataclass(frozen=True)
-class DiffLine:
-    sign: str
-    text: str
-    old_line: int | None = None
-    new_line: int | None = None
-
-
-@dataclass
-class DiffHunk:
-    header: str
-    old_start: int
-    old_count: int
-    new_start: int
-    new_count: int
-    context: str
-    lines: list[DiffLine]
-
-
 @dataclass
 class TargetChangeGroup:
     first_changed: int
@@ -910,19 +886,6 @@ class TargetChangeGroup:
     top: int
     bottom: int
     changed_lines: set[int]
-
-
-@dataclass(frozen=True)
-class NetOldLineState:
-    text: str
-    from_task: bool = False
-    old_entry_ids: tuple[int, ...] = ()
-
-
-@dataclass(frozen=True)
-class NetOldEntry:
-    index: int
-    lines: list[PromptLine]
 
 
 @dataclass(frozen=True)
@@ -1142,30 +1105,7 @@ def load_final_blame_lines(target: str, path: str, task_shas: set[str]) -> list[
         out = run_git(["blame", "--line-porcelain", target, "--", path])
     except ToolError:
         return []
-    pending: tuple[str, int, int] | None = None
-    lines: list[BlameLine] = []
-    for raw in out.decode("utf-8", errors="replace").splitlines():
-        match = BLAME_HEADER_RE.match(raw)
-        if match:
-            pending = (
-                match.group(1).lower(),
-                int(match.group(2)),
-                int(match.group(3)),
-            )
-            continue
-        if pending is None or not raw.startswith("\t"):
-            continue
-        sha, source_line, target_line = pending
-        pending = None
-        if sha not in task_shas:
-            continue
-        lines.append(BlameLine(
-            sha=sha,
-            source_line=source_line,
-            target_line=target_line,
-            text=raw[1:],
-        ))
-    return lines
+    return parse_final_blame(out, task_shas)
 
 
 def build_task_scoped_prompt_blocks(
@@ -1284,7 +1224,7 @@ def collect_old_lines_by_group(
     start = commit_parent_or_none(commits[-1].sha)
     states = load_net_old_initial_state(start, path)
     history = load_net_old_history_patches(start, target, path)
-    entries: list[NetOldEntry] = []
+    entries: list[NetOldEntry[str]] = []
 
     for sha, hunks in history:
         if not hunks:
@@ -1328,7 +1268,7 @@ def commit_parent_or_none(sha: str) -> str | None:
     return None
 
 
-def load_net_old_initial_state(start: str | None, path: str) -> list[NetOldLineState]:
+def load_net_old_initial_state(start: str | None, path: str) -> list[NetOldLineState[str]]:
     if start is None:
         return []
     try:
@@ -1345,7 +1285,7 @@ def load_net_old_history_patches(
     start: str | None,
     target: str,
     path: str,
-) -> list[tuple[str, list[DiffHunk]]]:
+) -> list[tuple[str, list[DiffHunk[str]]]]:
     range_arg = target if start is None else f"{start}..{target}"
     try:
         raw = git_text([
@@ -1363,7 +1303,7 @@ def load_net_old_history_patches(
         return []
 
     chunks = raw.split(NET_OLD_COMMIT_SEPARATOR)
-    history: list[tuple[str, list[DiffHunk]]] = []
+    history: list[tuple[str, list[DiffHunk[str]]]] = []
     for index in range(1, len(chunks) - 1, 2):
         sha = chunks[index].strip()
         if not sha:
@@ -1372,143 +1312,22 @@ def load_net_old_history_patches(
     return history
 
 
-def hunk_old_index(hunk: DiffHunk) -> int:
-    return hunk.old_start if hunk.old_count == 0 else hunk.old_start - 1
-
-
 def apply_net_old_hunks(
-    states: list[NetOldLineState],
-    hunks: list[DiffHunk],
+    states: list[NetOldLineState[str]],
+    hunks: list[DiffHunk[str]],
     *,
     is_task_commit: bool,
-    entries: list[NetOldEntry],
+    entries: list[NetOldEntry[str]],
     project_query: bool = False,
-) -> list[NetOldLineState]:
-    current = list(states)
-    for hunk in sorted(hunks, key=hunk_old_index, reverse=True):
-        start = max(0, min(len(current), hunk_old_index(hunk)))
-        projected = (
-            project_reviewable_lines(
-                "Reports/Template.xml",
-                [state.text for state in current],
-            ).lines
-            if project_query
-            else None
-        )
-        new_segment = build_net_old_hunk_segment(
-            current,
-            hunk,
-            start=start,
-            is_task_commit=is_task_commit,
-            entries=entries,
-            projected=projected,
-        )
-        end = max(start, min(len(current), start + hunk.old_count))
-        current[start:end] = new_segment
-    return current
-
-
-def build_net_old_hunk_segment(
-    states: list[NetOldLineState],
-    hunk: DiffHunk,
-    *,
-    start: int,
-    is_task_commit: bool,
-    entries: list[NetOldEntry],
-    projected: dict[int, str] | None = None,
-) -> list[NetOldLineState]:
-    removed_states: list[tuple[int, NetOldLineState]] = []
-    index = start
-    for line in hunk.lines:
-        if line.sign not in {" ", "-"}:
-            continue
-        state = states[index] if index < len(states) else NetOldLineState(text=line.text)
-        if line.sign == "-":
-            removed_states.append((index + 1, state))
-        index += 1
-
-    task_entry_ids: tuple[int, ...] = ()
-    if is_task_commit:
-        carried: list[int] = []
-        external_old_lines: list[PromptLine] = []
-        for lineno, state in removed_states:
-            if state.from_task:
-                carried.extend(state.old_entry_ids)
-            elif projected is None or lineno in projected:
-                external_old_lines.append(PromptLine(
-                    sign="-",
-                    text=state.text if projected is None else projected[lineno],
-                ))
-        if external_old_lines:
-            entries.append(NetOldEntry(index=len(entries), lines=external_old_lines))
-            carried.append(entries[-1].index)
-        task_entry_ids = tuple(dict.fromkeys(carried))
-
-    index = start
-    new_segment: list[NetOldLineState] = []
-    for line in hunk.lines:
-        if line.sign == " ":
-            state = states[index] if index < len(states) else NetOldLineState(text=line.text)
-            new_segment.append(state)
-            index += 1
-        elif line.sign == "-":
-            index += 1
-        elif line.sign == "+":
-            new_segment.append(NetOldLineState(
-                text=line.text,
-                from_task=is_task_commit,
-                old_entry_ids=task_entry_ids if is_task_commit else (),
-            ))
-    return new_segment
-
-
-def parse_unified_diff_hunks(diff_text: str) -> list[DiffHunk]:
-    lines = diff_text.splitlines()
-    hunks: list[DiffHunk] = []
-    i = 0
-    while i < len(lines):
-        header = lines[i]
-        match = HUNK_HEADER_RE.match(header)
-        if not match:
-            i += 1
-            continue
-        old_start = int(match.group("old_start"))
-        new_start = int(match.group("new_start"))
-        old_count = int(match.group("old_count") or "1")
-        new_count = int(match.group("new_count") or "1")
-        old_line = old_start
-        new_line = new_start
-        diff_lines: list[DiffLine] = []
-        i += 1
-        while i < len(lines) and not HUNK_HEADER_RE.match(lines[i]):
-            raw = lines[i]
-            i += 1
-            if not raw or raw.startswith("\\ No newline"):
-                continue
-            if raw.startswith(("diff --git", "index ", "--- ", "+++ ")):
-                continue
-            sign = raw[0]
-            text = raw[1:]
-            if sign == "+":
-                diff_lines.append(DiffLine(sign=sign, text=text, new_line=new_line))
-                new_line += 1
-            elif sign == "-":
-                diff_lines.append(DiffLine(sign=sign, text=text, old_line=old_line))
-                old_line += 1
-            elif sign == " ":
-                diff_lines.append(DiffLine(sign=sign, text=text, old_line=old_line, new_line=new_line))
-                old_line += 1
-                new_line += 1
-        hunks.append(DiffHunk(
-            header=header,
-            old_start=old_start,
-            old_count=old_count,
-            new_start=new_start,
-            new_count=new_count,
-            context=match.group("context") or "",
-            lines=diff_lines,
-        ))
-    return hunks
+) -> list[NetOldLineState[str]]:
+    project = (
+        lambda current: project_reviewable_lines(
+            "Reports/Template.xml", [state.text for state in current],
+        ).lines
+    ) if project_query else None
+    return replay_task_hunks(
+        states, hunks, is_task_commit=is_task_commit, entries=entries, project=project, strict=False,
+    )
 
 
 def format_hunk_range(start: int, count: int) -> str:
@@ -2364,6 +2183,10 @@ def build_init_parser() -> argparse.ArgumentParser:
         help="Записать versioned machine-readable результат init в JSON-файл.",
     )
     parser.add_argument(
+        "--result-schema-version", type=int, choices=(1, 2), default=None,
+        help="Версия JSON-результата init (по умолчанию 1; версия 2 включает сравнение файлов).",
+    )
+    parser.add_argument(
         "--user-instruction",
         default=None,
         metavar="TEXT",
@@ -2613,24 +2436,6 @@ def collect_source_prompt_data(
     bsl_paths = [p for p in existing_paths if is_bsl(p)]
     template_candidates = [p for p in existing_paths if is_report_template(p)]
     checkout_paths = sorted(set(bsl_paths + template_candidates))
-    if not all_paths:
-        report_reviewable_file_boundary(
-            all_paths=all_paths,
-            existing_paths=existing_paths,
-            prompt_files=[],
-            task=task,
-            batch_mode=batch_mode,
-        )
-        return None, EXIT_NO_PATHS, NO_REVIEWABLE_FILES_HINT
-    if not existing_paths:
-        report_reviewable_file_boundary(
-            all_paths=all_paths,
-            existing_paths=existing_paths,
-            prompt_files=[],
-            task=task,
-            batch_mode=batch_mode,
-        )
-        return None, EXIT_NO_PATHS, NO_REVIEWABLE_FILES_HINT
     if not checkout_paths:
         report_reviewable_file_boundary(
             all_paths=all_paths,
@@ -2793,121 +2598,140 @@ def run_for_collected_sources(
     force: bool = False,
     user_instruction: str | None = None,
     result_recorder: InitResultRecorder | None = None,
+    comparison_sources: list[ComparisonSource] | None = None,
 ) -> tuple[int, PreparedReview | None]:
     safe_task = review_dir_name or sanitize_task(task)
     kebab_task = task_to_kebab(task)
     review_dir = reviews_root / safe_task
+    with task_lock(review_dir):
+        if not force:
+            meta_file = review_dir / "_review_info" / "meta.txt"
+            if meta_file.exists() and has_completed_result_status(read_text_safe(meta_file)):
+                message = f"Ревью для задачи '{task}' уже завершено. Используйте флаг --force для перезаписи."
+                _eprint(
+                    message,
+                    task=task,
+                    batch=batch_mode,
+                )
+                if result_recorder is not None:
+                    result_recorder.record_expected_stop("already_done", message, review_dir.resolve())
+                return EXIT_USAGE, None
 
-    if not force:
-        meta_file = review_dir / "_review_info" / "meta.txt"
-        if meta_file.exists() and has_completed_result_status(read_text_safe(meta_file)):
-            message = f"Ревью для задачи '{task}' уже завершено. Используйте флаг --force для перезаписи."
+        if not collected:
+            code = next(
+                (error_code for error_code, _ in errors if error_code not in {EXIT_NO_COMMITS, EXIT_NO_PATHS}),
+                EXIT_NO_COMMITS if errors and all(error_code == EXIT_NO_COMMITS for error_code, _ in errors) else EXIT_NO_PATHS,
+            )
+            if errors:
+                _eprint(errors[0][1], task=task, batch=batch_mode)
+            if code != EXIT_NO_PATHS or not comparison_sources:
+                return code, None
+
+        files = [file for item in collected for file in item.prompt_files]
+        duplicates = duplicate_prompt_paths(files)
+        if duplicates:
             _eprint(
-                message,
+                "Найдены дублирующиеся BSL-пути в PromptFile.path: " + ", ".join(duplicates) + ". Пути должны быть уникальны во всех репозиториях задачи.",
                 task=task,
                 batch=batch_mode,
             )
-            if result_recorder is not None:
-                result_recorder.record_expected_stop("already_done", message, review_dir.resolve())
             return EXIT_USAGE, None
 
-    if not collected:
-        code = EXIT_NO_COMMITS if errors and all(error_code == EXIT_NO_COMMITS for error_code, _ in errors) else EXIT_NO_PATHS
-        if errors:
-            _eprint(errors[0][1], task=task, batch=batch_mode)
-        return code, None
-
-    files = [file for item in collected for file in item.prompt_files]
-    duplicates = duplicate_prompt_paths(files)
-    if duplicates:
-        _eprint(
-            "Найдены дублирующиеся BSL-пути в PromptFile.path: " + ", ".join(duplicates) + ". Пути должны быть уникальны во всех репозиториях задачи.",
-            task=task,
-            batch=batch_mode,
-        )
-        return EXIT_USAGE, None
-
-    source0 = collected[0].source
-    commits = [commit for item in collected for commit in item.source.commits]
-    target = source0.target if len(collected) == 1 else "multi-repository"
-    base = source0.base if len(collected) == 1 else ""
-    source_kind = source0.source_kind if len(collected) == 1 else "task"
-    mr_id = source0.mr_id if len(collected) == 1 else None
-    mr_ref = source0.mr_ref if len(collected) == 1 else None
-    timestamp = aggregate_timestamp(collected)
-
-    reset_review_dir(review_dir)
-    (review_dir / "_review_info").mkdir(parents=True, exist_ok=True)
-    write_user_instruction(review_dir, user_instruction)
-
-    try:
-        priority = generate_review_prompts_from_files(
-            review_dir,
-            task=task,
-            ref=source0.ref,
-            target=target,
-            base=base,
-            commits=commits,
-            files=files,
-            timestamp=timestamp,
-            source_kind=source_kind,
-            mr_id=mr_id,
-            mr_ref=mr_ref,
-            config=config.review_prompt,
-            counter=counter,
-        )
-    except (ConfigError, ToolError, ImportError) as exc:
-        _eprint(str(exc), task=task, batch=batch_mode)
-        return EXIT_USAGE, None
-
-    # Детерминированный артефакт индексов БД для ревью производительности запросов.
-    # Индексы каждого репозитория уже собраны в `collect_source_prompt_data`
-    # (там доступны worktree с BSL и реальный target-ref); здесь агрегируем и
-    # пишем одним файлом — единый путь для single- и multi-repo (аддитивно).
-    write_indexes_objects(
-        review_dir,
-        [obj for item in collected for obj in item.object_indexes],
-    )
-    write_metadata_objects(
-        review_dir,
-        [obj for item in collected for obj in item.object_metadata],
-    )
-    write_review_source_links(review_dir, collected)
-
-    generate_meta(
-        review_dir,
-        task=task,
-        ref=source0.ref,
-        target=target,
-        commits_count=len(commits),
-        timestamp=timestamp,
-        priority=priority,
-        source_kind=source_kind,
-        mr_id=mr_id,
-        mr_ref=mr_ref,
-    )
-
-    copy_dev_standarts(review_dir)
-    try:
-        write_reference_catalog(review_dir)
-    except ReferenceCatalogError as exc:
-        _eprint(str(exc), task=task, batch=batch_mode)
         reset_review_dir(review_dir)
-        return EXIT_USAGE, None
-    copy_platform_database_indexes(review_dir)
-    generate_task_agents(review_dir, task=task, kebab_task=kebab_task)
+        prepared = None
+        if collected:
+            source0 = collected[0].source
+            commits = [commit for item in collected for commit in item.source.commits]
+            target = source0.target if len(collected) == 1 else "multi-repository"
+            base = source0.base if len(collected) == 1 else ""
+            source_kind = source0.source_kind if len(collected) == 1 else "task"
+            mr_id = source0.mr_id if len(collected) == 1 else None
+            mr_ref = source0.mr_ref if len(collected) == 1 else None
+            timestamp = aggregate_timestamp(collected)
 
-    return EXIT_OK, PreparedReview(
-        task=task,
-        review_dir=review_dir,
-        batch_mode=batch_mode,
-        source_ref=source0.ref,
-        target=target,
-        commits_count=len(commits),
-        source_kind=source_kind,
-        mr_id=mr_id,
-        mr_ref=mr_ref,
-    )
+            (review_dir / "_review_info").mkdir(parents=True, exist_ok=True)
+            write_user_instruction(review_dir, user_instruction)
+
+            try:
+                priority = generate_review_prompts_from_files(
+                    review_dir,
+                    task=task,
+                    ref=source0.ref,
+                    target=target,
+                    base=base,
+                    commits=commits,
+                    files=files,
+                    timestamp=timestamp,
+                    source_kind=source_kind,
+                    mr_id=mr_id,
+                    mr_ref=mr_ref,
+                    config=config.review_prompt,
+                    counter=counter,
+                )
+            except (ConfigError, ToolError, ImportError) as exc:
+                _eprint(str(exc), task=task, batch=batch_mode)
+                return EXIT_USAGE, None
+
+            # Детерминированный артефакт индексов БД для ревью производительности запросов.
+            # Индексы каждого репозитория уже собраны в `collect_source_prompt_data`
+            # (там доступны worktree с BSL и реальный target-ref); здесь агрегируем и
+            # пишем одним файлом — единый путь для single- и multi-repo (аддитивно).
+            write_indexes_objects(
+                review_dir,
+                [obj for item in collected for obj in item.object_indexes],
+            )
+            write_metadata_objects(
+                review_dir,
+                [obj for item in collected for obj in item.object_metadata],
+            )
+            write_review_source_links(review_dir, collected)
+
+            generate_meta(
+                review_dir,
+                task=task,
+                ref=source0.ref,
+                target=target,
+                commits_count=len(commits),
+                timestamp=timestamp,
+                priority=priority,
+                source_kind=source_kind,
+                mr_id=mr_id,
+                mr_ref=mr_ref,
+            )
+
+            copy_dev_standarts(review_dir)
+            try:
+                write_reference_catalog(review_dir)
+            except ReferenceCatalogError as exc:
+                _eprint(str(exc), task=task, batch=batch_mode)
+                reset_review_dir(review_dir)
+                return EXIT_USAGE, None
+            copy_platform_database_indexes(review_dir)
+            generate_task_agents(review_dir, task=task, kebab_task=kebab_task)
+
+            prepared = PreparedReview(
+                task=task,
+                review_dir=review_dir,
+                batch_mode=batch_mode,
+                source_ref=source0.ref,
+                target=target,
+                commits_count=len(commits),
+                source_kind=source_kind,
+                mr_id=mr_id,
+                mr_ref=mr_ref,
+            )
+
+        if comparison_sources:
+            summary = write_comparison(task, review_dir, comparison_sources, viewer=config.diff_viewer)
+            if result_recorder is not None:
+                result_recorder.comparisons.append(summary)
+            _eprint(f"Сравнение файлов: {summary.state}. Каталог: {review_dir / '_review_info' / 'changes'}",
+                    task=task, batch=batch_mode)
+            for warning in summary.warnings:
+                _eprint(warning.message, task=task, batch=batch_mode)
+            if summary.error:
+                _eprint(summary.error.message, task=task, batch=batch_mode)
+        return EXIT_OK if prepared is not None else EXIT_NO_PATHS, prepared
 
 
 def publish_prepared_review(
@@ -3023,6 +2847,9 @@ def _resolve_init_groups(
 
 
 def _validate_init_args(args: argparse.Namespace, task_count: int) -> int | None:
+    if args.result_schema_version is not None and args.result_path is None:
+        print("Флаг --result-schema-version требует --result-path.", file=sys.stderr)
+        return EXIT_USAGE
     if args.review_dir_name is not None:
         error = validate_review_dir_name(args.review_dir_name)
         if error is not None:
@@ -3115,6 +2942,7 @@ def _run_task_sources_across_repositories(
 
     for task in group.tasks:
         collected: list[CollectedSource] = []
+        comparison_sources: list[ComparisonSource] = []
         errors: list[tuple[int, str]] = []
         for context in contexts:
             try:
@@ -3127,6 +2955,8 @@ def _run_task_sources_across_repositories(
                     task,
                     candidate_commits=candidates,
                 )
+                if source.commits:
+                    comparison_sources.append(source.comparison_source(context.root))
                 item, code, message = collect_source_prompt_data(
                     source,
                     context.root,
@@ -3155,6 +2985,7 @@ def _run_task_sources_across_repositories(
             force=force,
             user_instruction=user_instruction,
             result_recorder=result_recorder,
+            comparison_sources=comparison_sources,
         )
         if code == EXIT_OK and prepared is not None:
             prepared_reviews.append(prepared)
@@ -3213,6 +3044,7 @@ def _run_mr_sources_single_repository(
             force=args.force,
             user_instruction=args.user_instruction,
             result_recorder=result_recorder,
+            comparison_sources=[source.comparison_source(context.root)] if source.commits else [],
         )
         if code == EXIT_OK and prepared is not None:
             prepared_reviews.append(prepared)
@@ -3388,11 +3220,11 @@ def run_init(argv: list[str]) -> int:
     recorder = InitResultRecorder()
     try:
         exit_code = _run_init_parsed(args, result_recorder=recorder)
-    except ToolError as exc:
+    except (ToolError, OSError) as exc:
         print(str(exc), file=sys.stderr)
-        exit_code = exc.exit_code
+        exit_code = exc.exit_code if isinstance(exc, ToolError) else EXIT_USAGE
     if result_path is not None:
-        write_init_result(result_path, recorder.envelope(exit_code))
+        write_init_result(result_path, recorder.envelope(exit_code, args.result_schema_version or 1))
     return exit_code
 
 

@@ -614,6 +614,8 @@
       cancelHidden: !actions.includes("cancel"),
       openAgentLogHidden:
         !["review_running", "done"].includes(status.detailStatus) || !hasText(status.jobId) || !actions.includes("open_agent_log"),
+      openChangesHidden:
+        !hasText(status.jobId) || !actions.includes("open_changes"),
       openReportHidden: !actions.includes("open_report") || !status.reportPath,
       openReasoningHidden: !actions.includes("open_reasoning") || !status.reasoningPath,
       summaryHidden: !status.summary,
@@ -657,6 +659,7 @@
     $("prepareConfirmCancel").disabled = ui.prepareDisabled || state.reviewRequestPending;
     $("cancelReview").hidden = ui.cancelHidden;
     $("openAgentLog").hidden = ui.openAgentLogHidden;
+    $("openChanges").hidden = ui.openChangesHidden;
     $("openReport").hidden = ui.openReportHidden;
     $("openReasoning").hidden = ui.openReasoningHidden;
     renderSourceSelector(context);
@@ -956,7 +959,7 @@
     const container = $("diagnostics");
     container.hidden = ui.diagnosticsHidden;
     container.textContent = "";
-    if (ui.diagnosticsHidden || !status.feedback) {
+    if (ui.diagnosticsHidden) {
       return;
     }
     renderFeedback(container, status.feedback, status.diagnostics, status.jobId, state.api);
@@ -978,7 +981,7 @@
     }
     const seen = new Set();
     return entries.filter((entry) => {
-      if (!entry || typeof entry !== "object" || !hasText(entry.id) || !hasText(entry.label) || seen.has(entry.id)) {
+      if (!entry || typeof entry !== "object" || !hasText(entry.id) || entry.id.startsWith("comparison.") || !hasText(entry.label) || seen.has(entry.id)) {
         return false;
       }
       const hasValue = entry.value !== null && entry.value !== undefined && (typeof entry.value !== "string" || hasText(entry.value));
@@ -1352,6 +1355,27 @@
     return openAgentLog(state.api, jobId, $("openAgentLog"));
   }
 
+  async function openChanges(apiClient, jobId, button, feedbackFn) {
+    if (!apiClient || !jobId || !button || button.disabled) {
+      return false;
+    }
+    const showFeedback = feedbackFn || root.RdvUiFeedback.flashButtonFeedback;
+    button.disabled = true;
+    try {
+      await apiClient.openChanges(jobId);
+      showFeedback(button, { success: true, successLabel: "✓" });
+      return true;
+    } catch {
+      showFeedback(button, { success: false, failLabel: "×" });
+      return false;
+    }
+  }
+
+  function handleOpenChanges() {
+    const jobId = state.status && state.status.jobId;
+    return openChanges(state.api, jobId, $("openChanges"));
+  }
+
   function buildReportPageUrl(jobId, runtime, issueKey) {
     return root.RdvArtifactPageUtils.buildReportPageUrl(jobId, runtime, issueKey);
   }
@@ -1442,6 +1466,7 @@
     $("prepareConfirmCancel").addEventListener("click", handlePrepareConfirmCancel);
     $("cancelReview").addEventListener("click", cancelReview);
     $("openAgentLog").addEventListener("click", handleOpenAgentLog);
+    $("openChanges").addEventListener("click", handleOpenChanges);
     $("openReport").addEventListener("click", () => openReport({ background: false }));
     $("openReasoning").addEventListener("click", () => openReasoning({ background: false }));
     $("openReport").addEventListener("mousedown", preventArtifactMiddleMouseDefault);
@@ -1491,6 +1516,7 @@
       renderFeedback,
       handleArtifactAuxClick,
       openAgentLog,
+      openChanges,
       openProjectConfig,
       openInstructionEditor,
       isSupportedJiraIssueContext,

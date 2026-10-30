@@ -91,6 +91,10 @@ class LocalReviewHandler(BaseHTTPRequestHandler):
                 return service.cancel(job_id)
             if method == "POST" and action == "open-agent-log":
                 return service.open_agent_log(job_id)
+            if method == "POST" and action == "open-review-bsl":
+                return service.open_review_bsl(job_id)
+            if method == "POST" and action == "open-changes":
+                return service.open_changes(job_id)
             if method == "POST" and action == "open-log":
                 return service.open_job_log(job_id, self._json_body())
         return 404, structured_error("not_found", "Endpoint not found.")

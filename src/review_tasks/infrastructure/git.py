@@ -34,7 +34,8 @@ def git_env() -> dict[str, str]:
 
 
 def _run(args: list[str], cwd: Path | None = None,
-         input_bytes: bytes | None = None, check: bool = True) -> subprocess.CompletedProcess:
+         input_bytes: bytes | None = None, check: bool = True,
+         timeout: float | None = None) -> subprocess.CompletedProcess:
     """Единая точка вызова git. Возвращает CompletedProcess (bytes)."""
     result = subprocess.run(
         args,
@@ -42,6 +43,7 @@ def _run(args: list[str], cwd: Path | None = None,
         input=input_bytes,
         capture_output=True,
         env=git_env(),
+        timeout=timeout,
     )
     if check and result.returncode != 0:
         cmd = " ".join(args)
@@ -51,10 +53,11 @@ def _run(args: list[str], cwd: Path | None = None,
 
 
 def run_git(args: list[str], cwd: Path | None = None,
-            input_bytes: bytes | None = None, check: bool = True) -> bytes:
+            input_bytes: bytes | None = None, check: bool = True,
+            timeout: float | None = None) -> bytes:
     """Выполнить git с корректной UTF-8 обработкой путей и вернуть stdout-bytes."""
     full = ["git", "-c", "core.quotepath=false"] + args
-    return _run(full, cwd=cwd, input_bytes=input_bytes, check=check).stdout
+    return _run(full, cwd=cwd, input_bytes=input_bytes, check=check, timeout=timeout).stdout
 
 
 def git_text(args: list[str], cwd: Path | None = None, check: bool = True) -> str:

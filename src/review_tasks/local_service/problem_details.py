@@ -6,7 +6,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
-from review_tasks.review_init.result import InitResultEnvelope
+from review_tasks.review_init.result import InitResultEnvelope, parse_init_result
+from review_tasks.review_init.comparison import ComparisonSummary
 
 from .storage import read_json
 
@@ -152,7 +153,7 @@ def unique_diagnostics(entries: list[dict[str, Any] | None]) -> list[dict[str, A
 
 def load_init_result(path, exit_code: int) -> InitResultEnvelope:
     try:
-        result = InitResultEnvelope.model_validate(read_json(path))
+        result = parse_init_result(read_json(path))
     except (OSError, ValueError, ValidationError) as exc:
         raise InitResultProtocolError(f"init result is missing or invalid: {exc}") from exc
     if result.outcome == "success" and exit_code != 0:
@@ -201,12 +202,13 @@ def canonical_status_contract(status: dict[str, Any]) -> tuple[dict[str, str] | 
     except ValidationError:
         feedback = legacy_feedback(status)
 
+    comparison_entries = comparison_diagnostics(status)
     if feedback is not None and feedback.get("tone") == "info":
-        return feedback, []
+        return feedback, comparison_entries
 
     raw_diagnostics = status.get("diagnostics")
     if not isinstance(raw_diagnostics, list):
-        return feedback, legacy_diagnostics(status)
+        return feedback, unique_diagnostics([*legacy_diagnostics(status), *comparison_entries])
     entries: list[dict[str, Any] | None] = []
     for raw_entry in raw_diagnostics:
         try:
@@ -214,4 +216,16 @@ def canonical_status_contract(status: dict[str, Any]) -> tuple[dict[str, str] | 
         except ValidationError:
             continue
         entries.append(entry.model_dump(mode="json", by_alias=True, exclude_none=True))
-    return feedback, unique_diagnostics(entries)
+    return feedback, unique_diagnostics([*entries, *comparison_entries])
+
+
+def comparison_diagnostics(status: dict[str, Any]) -> list[dict[str, Any]]:
+    try:
+        summary = ComparisonSummary.model_validate(status.get("comparison"))
+    except (ValueError, TypeError):
+        return []
+    entries = [diagnostic_entry(f"comparison.{index}", "Сравнение файлов", "data",
+               value=warning.model_dump(exclude_none=True)) for index, warning in enumerate(summary.warnings)]
+    if summary.error:
+        entries.append(diagnostic_entry("comparison.error", "Сравнение недоступно", "text", value=summary.error.message))
+    return entries
