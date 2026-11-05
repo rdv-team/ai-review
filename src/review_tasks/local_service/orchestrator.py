@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -22,7 +23,7 @@ from review_tasks.integrations.mcp_registry import (
 from review_tasks.review_init import prefix_config
 from review_tasks.review_result.review_yaml import expand_review_result_inputs, read_review_yaml_documents
 
-from .contracts import DETAIL_TEXT, actions_for, now_iso, status_to_popup
+from .contracts import ApiError, DETAIL_TEXT, actions_for, normalize_opencode_model, now_iso, status_to_popup
 from .gitlab import GitLabInstance, GitRemoteCommandOutput, normalize_gitlab_project_path, resolve_git_remote
 from .job_logs import build_detail_diagnostics, build_log_diagnostics
 from .logging_setup import log_agent_end, log_agent_start, log_error, log_init_end, log_init_start
@@ -453,7 +454,9 @@ class JobOrchestrator:
                 detailStatus="handoff_required",
                 detailText=DETAIL_TEXT["handoff_required"],
                 availableActions=["submit", "refresh"],
-                manualCommand=build_manual_runner_command(request["ide"], task_dir),
+                manualCommand=build_manual_runner_command(
+                    request["ide"], task_dir, opencode_model=resolved_init["opencodeModel"]
+                ),
                 error=None,
             )
             return
@@ -477,6 +480,7 @@ class JobOrchestrator:
                 run_dir,
                 str(resolved_init["opencodeBin"]),
                 str(resolved_init["opencodePermissionApprovalFlag"]),
+                resolved_init["opencodeModel"],
             )
             return
 
@@ -556,7 +560,7 @@ class JobOrchestrator:
         elif request["ide"] == "cursor":
             resolved.update(self._preflight_cursor(job_id, run_dir))
         else:
-            resolved.update(self._preflight_opencode(job_id, run_dir))
+            resolved.update(self._preflight_opencode(job_id, run_dir, resolved["opencodeModel"]))
         return resolved
 
     def _persist_selected_mr_source(
@@ -718,11 +722,13 @@ class JobOrchestrator:
             )
         return {"cursorBin": cursor_bin, "cursorModel": resolved_model}
 
-    def _preflight_opencode(self, job_id: str, run_dir: Path) -> dict[str, Any]:
+    def _preflight_opencode(self, job_id: str, run_dir: Path, model: str = "") -> dict[str, Any]:
         opencode_bin = self._resolve_executable("opencode", "REVIEW_TASKS_OPENCODE_BIN")
         self._preflight_command(job_id, [str(opencode_bin), "--version"], run_dir, "opencode")
         help_text = self._preflight_command(job_id, [str(opencode_bin), "run", "--help"], run_dir, "opencode-run-help")
         missing = [flag for flag in OPENCODE_REQUIRED_COMMON_RUN_FLAGS if flag not in help_text]
+        if model and "--model" not in help_text:
+            missing.append("--model")
         if missing:
             raise PreflightError(
                 "preflight_failed",
@@ -1022,6 +1028,7 @@ class JobOrchestrator:
         run_dir: Path,
         opencode_bin: str,
         permission_approval_flag: str,
+        model: str = "",
     ) -> None:
         self._check_cancel(job_id)
         stdout = run_dir / "opencode.stdout.log"
@@ -1031,6 +1038,7 @@ class JobOrchestrator:
             run_dir,
             executable=opencode_bin,
             permission_approval_flag=permission_approval_flag,
+            model=model,
         )
         self.store.update_status(
             job_id,
@@ -1363,6 +1371,12 @@ def resolve_init_config(request: dict[str, Any]) -> dict[str, Any]:
     saved = config.get(request["projectKey"])
     if not isinstance(saved, dict):
         saved = {}
+    opencode_model = ""
+    if request["ide"] == "opencode":
+        try:
+            opencode_model = normalize_opencode_model(saved.get("opencode_model", ""))
+        except ApiError as exc:
+            raise PreflightError("preflight_failed", f"OpenCode project config: {exc}") from exc
     saved_repositories = prefix_config.entry_repositories(saved)
     repo_path = init.get("repoPath") or prefix_config.repositories_to_api_value(saved_repositories)
     reviews_root = init.get("reviewsRoot") or saved.get("reviews_dir")
@@ -1381,6 +1395,7 @@ def resolve_init_config(request: dict[str, Any]) -> dict[str, Any]:
         "branch": str(branch),
         "remote": str(remote),
         "mcpMode": "required" if saved.get("mcp_enabled", True) else "off",
+        "opencodeModel": opencode_model,
     }
 
 
@@ -1501,9 +1516,10 @@ def build_opencode_argv(
     *,
     executable: str = "opencode",
     permission_approval_flag: str,
+    model: str = "",
 ) -> list[str]:
     del run_dir
-    return [
+    argv = [
         executable,
         "run",
         "--dir",
@@ -1512,13 +1528,16 @@ def build_opencode_argv(
         OPENCODE_REVIEW_COMMAND,
         permission_approval_flag,
     ]
+    if model:
+        argv.extend(["--model", model])
+    return argv
 
 
 def select_opencode_permission_approval_flag(help_text: str) -> str | None:
     return next((flag for flag in OPENCODE_PERMISSION_APPROVAL_FLAGS if flag in help_text), None)
 
 
-def build_manual_runner_command(ide: str, task_dir: Path) -> str:
+def build_manual_runner_command(ide: str, task_dir: Path, *, opencode_model: str = "") -> str:
     if ide == "cursor":
         model = os.environ.get("REVIEW_TASKS_CURSOR_MODEL", "").strip() or CURSOR_DEFAULT_MODEL
         return (
@@ -1526,6 +1545,12 @@ def build_manual_runner_command(ide: str, task_dir: Path) -> str:
             f'--model {model} --output-format text "{CURSOR_REVIEW_PROMPT}"'
         )
     if ide == "opencode":
+        if opencode_model:
+            argv = ["opencode", "run", "--dir", str(task_dir), "--command", OPENCODE_REVIEW_COMMAND,
+                    "--model", opencode_model]
+            if os.name == "nt":
+                return "& " + " ".join("'" + arg.replace("'", "''") + "'" for arg in argv)
+            return shlex.join(argv)
         return f'opencode run --dir "{task_dir}" --command {OPENCODE_REVIEW_COMMAND}'
     return subprocess.list2cmdline([
         "codex",

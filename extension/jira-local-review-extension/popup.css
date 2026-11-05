@@ -31,19 +31,48 @@ body {
 }
 
 .topbar {
-  align-items: start;
+  align-items: center;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 0 12px;
+}
+
+.brand {
+  align-items: center;
   display: flex;
-  justify-content: space-between;
-  gap: 12px;
+  gap: 4px;
+  white-space: nowrap;
+}
+
+.brand-logo {
+  display: block;
+  height: 32px;
+  object-fit: contain;
+  width: 32px;
+}
+
+.brand-name {
+  color: #18354c;
+  font-size: 16px;
+  font-weight: 800;
+  letter-spacing: -.5px;
+  line-height: 1.1;
+}
+
+.brand-name em {
+  color: #009fc4;
+  font-style: normal;
 }
 
 .issue-key {
   font-size: 18px;
   font-weight: 700;
+  overflow-wrap: anywhere;
 }
 
 .issue-title {
   color: var(--brand-blue);
+  grid-column: 1 / -1;
   line-height: 1.35;
   margin-top: 3px;
   max-height: 38px;

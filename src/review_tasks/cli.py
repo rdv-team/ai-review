@@ -46,6 +46,7 @@ import tempfile
 from collections import defaultdict
 from dataclasses import dataclass, field
 from functools import lru_cache
+from io import TextIOWrapper
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterable
@@ -931,6 +932,12 @@ class PromptSlice:
     context_limits: dict[tuple[int, int], BlockContextLimit] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class PromptGenerationResult:
+    priority: int
+    input_truncated: bool
+
+
 @dataclass
 class TokenCounter:
     model: str
@@ -1522,8 +1529,8 @@ def generate_review_prompts_from_files(
     mr_ref: str | None,
     config: ReviewPromptConfig,
     counter: TokenCounter,
-) -> int:
-    """Сгенерировать staged-промпты и вернуть приоритет ревью."""
+) -> PromptGenerationResult:
+    """Сгенерировать staged-промпты, вернуть приоритет и полноту отбора."""
     common = prompt_common_values(
         task=task,
         ref=ref,
@@ -1535,14 +1542,14 @@ def generate_review_prompts_from_files(
         mr_id=mr_id,
         mr_ref=mr_ref,
     )
-    write_staged_review_prompts(
+    input_truncated = write_staged_review_prompts(
         review_dir,
         files=files,
         common=common,
         config=config,
         counter=counter,
     )
-    return review_priority_from_prompt_files(files)
+    return PromptGenerationResult(review_priority_from_prompt_files(files), input_truncated)
 
 
 def write_staged_review_prompts(
@@ -1552,7 +1559,8 @@ def write_staged_review_prompts(
     common: dict[str, str],
     config: ReviewPromptConfig,
     counter: TokenCounter,
-) -> None:
+) -> bool:
+    """Write staged artifacts and report omission of any reviewable block."""
     stage1_workflow = load_template("task/workflow/review_prompt_stage1.md")
     stage2_workflow = load_template("task/workflow/review_prompt_stage2.md")
     prompt_slice = select_single_prompt_slice(files, common, config, counter)
@@ -1631,6 +1639,12 @@ def write_staged_review_prompts(
         review_info / "review_lines.json",
         json.dumps(line_bounds, ensure_ascii=False, indent=2) + "\n",
     )
+    all_refs = {
+        (file_index, block_index)
+        for file_index, file in enumerate(files)
+        for block_index, _ in enumerate(file.blocks)
+    }
+    return bool(all_refs.difference(prompt_slice.selected))
 
 
 def review_priority_from_prompt_files(files: list[PromptFile]) -> int:
@@ -1983,11 +1997,12 @@ def generate_meta(review_dir: Path, task: str, ref: str, target: str,
                   priority: int,
                   source_kind: str = "task",
                   mr_id: int | None = None,
-                  mr_ref: str | None = None) -> None:
+                  mr_ref: str | None = None,
+                  input_truncated: bool = False) -> None:
     """Записать `_review_info/meta.txt` в детерминированном порядке полей.
 
     Порядок: task / ref / target / commits_count / timestamp / source /
-    priority / mr_id? / mr_ref?. Поля `mr_id` и `mr_ref` пишутся только в
+    priority / input_truncated / mr_id? / mr_ref?. Поля `mr_id` и `mr_ref` пишутся только в
     MR-режиме. `status: completed` добавляется ИИ-ревьюером после успешного
     отчёта и здесь не управляется.
     """
@@ -1999,6 +2014,7 @@ def generate_meta(review_dir: Path, task: str, ref: str, target: str,
         f"timestamp: {timestamp}",
         f"source: {source_kind}",
         f"priority: {priority}",
+        f"input_truncated: {str(input_truncated).lower()}",
     ]
     if mr_id is not None:
         lines.append(f"mr_id: {mr_id}")
@@ -2653,7 +2669,7 @@ def run_for_collected_sources(
             write_user_instruction(review_dir, user_instruction)
 
             try:
-                priority = generate_review_prompts_from_files(
+                prompt_result = generate_review_prompts_from_files(
                     review_dir,
                     task=task,
                     ref=source0.ref,
@@ -2693,7 +2709,8 @@ def run_for_collected_sources(
                 target=target,
                 commits_count=len(commits),
                 timestamp=timestamp,
-                priority=priority,
+                priority=prompt_result.priority,
+                input_truncated=prompt_result.input_truncated,
                 source_kind=source_kind,
                 mr_id=mr_id,
                 mr_ref=mr_ref,
@@ -3396,6 +3413,35 @@ def run_read_meta_summary(argv: list[str]) -> int:
     return EXIT_OK
 
 
+def run_read_feedback(argv: list[str]) -> int:
+    from .review_result import FeedbackReadError, read_task_feedback
+
+    # Captured Windows streams otherwise use the legacy system encoding.
+    for stream in (sys.stdout, sys.stderr):
+        if isinstance(stream, TextIOWrapper):
+            stream.reconfigure(encoding="utf-8", newline="\n")
+
+    parser = _task_command_parser(
+        "read-feedback",
+        "Вывести все сохранённые отзывы специалиста по задаче одним текстом.",
+    )
+    parser.add_argument("--task", required=True, metavar="TASK", help="Ключ задачи.")
+    args, parse_code = parse_args_or_usage(parser, argv)
+    if args is None:
+        return parse_code if parse_code is not None else EXIT_USAGE
+    task = args.task.strip()
+    if not task:
+        print("Параметр --task не должен быть пустым.", file=sys.stderr)
+        return EXIT_USAGE
+    try:
+        text = read_task_feedback(task)
+    except FeedbackReadError as exc:
+        print(str(exc), file=sys.stderr)
+        return EXIT_USAGE
+    sys.stdout.write(text)
+    return EXIT_OK
+
+
 def run_set_status(argv: list[str]) -> int:
     from .task_capsule.metadata import RUN_STATUSES, TaskMetadataError, set_completed
 
@@ -3457,6 +3503,7 @@ COMMAND_TABLE: dict[str, CommandSpec] = {
     "check-ready": CommandSpec(run_check_ready, "Проверить готовность текущей task capsule.", "general"),
     "mcp-ready": CommandSpec(run_mcp_ready, "Проверить разрешение MCP в текущей задаче.", "general"),
     "read-meta-summary": CommandSpec(run_read_meta_summary, "Прочитать compact metadata задачи.", "general"),
+    "read-feedback": CommandSpec(run_read_feedback, "Вывести сохранённые отзывы специалиста по задаче.", "general"),
     "set-status": CommandSpec(run_set_status, "Записать completion metadata задачи.", "general"),
     "stage1-add-candidate": CommandSpec(lambda argv: _run_stage1("add_main", argv), "Добавить кандидата.", "stage1"),
     "stage1-remove-candidate": CommandSpec(lambda argv: _run_stage1("remove_main", argv), "Удалить кандидата до Stage 2.", "stage1"),

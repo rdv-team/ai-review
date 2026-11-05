@@ -16,6 +16,7 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from collections.abc import Iterator
 
 import yaml
 from pydantic import ValidationError
@@ -28,6 +29,7 @@ from review_tasks.sgr_schema import (
     translate_validation_error,
 )
 from review_tasks.sgr_schema.normalization import normalize_review_result_mapping
+from review_tasks.sgr_schema.finding import Finding
 from review_tasks.review_result.stage1_storage import (
     STAGE1_NAME,
     STAGE2_NAME,
@@ -528,14 +530,33 @@ def _finding_heading(
     end_line = finding.end_line
     label = f"{file}:{start_line}-{end_line}"
     prefix = f"### №{number} — "
-    entry = source_links.get(document.source.parent, {}).get(_normalize_finding_path(file))
-    if entry is None:
-        return f"{prefix}{label}"
-    project_url, target, source_path = entry
-    destination = build_gitlab_blob_url(project_url, target, source_path, start_line, end_line)
+    destination = finding_source_url(document, finding, source_links)
     if destination is None:
         return f"{prefix}{label}"
     return f"{prefix}[{_escape_markdown_link_label(label)}]({destination})"
+
+
+def finding_source_url(
+    document: ReviewYamlDocument,
+    finding: Finding,
+    source_links: dict[Path, dict[str, SourceLink]],
+) -> str | None:
+    """Use the same validated permalink context for every report projection."""
+    entry = source_links.get(document.source.parent, {}).get(_normalize_finding_path(finding.file))
+    if entry is None:
+        return None
+    project_url, target, source_path = entry
+    return build_gitlab_blob_url(project_url, target, source_path, finding.start_line, finding.end_line)
+
+
+def published_findings(
+    documents: list[ReviewYamlDocument], severity: str,
+) -> Iterator[tuple[ReviewYamlDocument, Finding]]:
+    """Canonical source order within a severity group."""
+    for document in documents:
+        for finding in document.parsed.findings:
+            if finding.self_check.decision == "keep" and finding.severity == severity:
+                yield document, finding
 
 
 def _render_issues(
@@ -545,20 +566,15 @@ def _render_issues(
     next_number: int,
 ) -> tuple[str, int]:
     blocks: list[str] = []
-    for doc in documents:
-        for finding in doc.parsed.findings:
-            if finding.self_check.decision != "keep":
-                continue
-            if finding.severity != severity:
-                continue
-            header = _finding_heading(doc, finding, source_links, next_number)
-            body = [header]
-            body.append(f"- **Риск**: {SEVERITY_TITLES[severity].lower()}")
-            body.append(f"- **Суть**: {finding.observation}")
-            if finding.suggestion:
-                body.extend(_render_suggestion_markdown(finding.suggestion))
-            blocks.append("\n".join(body))
-            next_number += 1
+    for doc, finding in published_findings(documents, severity):
+        header = _finding_heading(doc, finding, source_links, next_number)
+        body = [header]
+        body.append(f"- **Риск**: {SEVERITY_TITLES[severity].lower()}")
+        body.append(f"- **Суть**: {finding.observation}")
+        if finding.suggestion:
+            body.extend(_render_suggestion_markdown(finding.suggestion))
+        blocks.append("\n".join(body))
+        next_number += 1
     return ("\n\n".join(blocks) if blocks else "_Нет замечаний._"), next_number
 
 

@@ -101,6 +101,16 @@
       return this.request(`/reviews/${encodeURIComponent(jobId)}/report`, { method: "GET" });
     }
 
+    getFeedback(jobId) {
+      return this.request(`/reviews/${encodeURIComponent(jobId)}/feedback`, { method: "GET" });
+    }
+
+    saveFeedback(jobId, feedback) {
+      return this.request(`/reviews/${encodeURIComponent(jobId)}/feedback`, {
+        method: "PUT", body: JSON.stringify(feedback)
+      });
+    }
+
     getReasoning(jobId) {
       return this.request(`/reviews/${encodeURIComponent(jobId)}/reasoning`, { method: "GET" });
     }

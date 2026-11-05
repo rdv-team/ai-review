@@ -83,6 +83,11 @@ class LocalReviewHandler(BaseHTTPRequestHandler):
                 return service.get_summary(job_id)
             if method == "GET" and action == "report":
                 return service.get_report(job_id)
+            if action == "feedback":
+                if method == "GET":
+                    return service.get_feedback(job_id)
+                if method == "PUT":
+                    return service.put_feedback(job_id, self._json_body())
             if method == "GET" and action == "reasoning":
                 return service.get_reasoning(job_id)
             if method == "GET" and action == "diagnostics":

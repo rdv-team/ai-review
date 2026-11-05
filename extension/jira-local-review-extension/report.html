@@ -8,20 +8,63 @@
   <body>
     <main class="report-page">
       <header class="report-header">
-        <div>
-          <h1 id="title">Отчет ревью</h1>
-          <div id="reportPath" class="report-path"></div>
+        <div class="heading">
+          <div class="brand">
+            <img class="brand-logo" src="icons/rdv-swift.svg" alt="" width="54" height="40">
+            <div class="brand-copy"><span class="brand-name">RDV <em>AIR</em></span><span class="brand-tagline">AI Review</span></div>
+          </div>
+          <div class="report-heading"><h1 id="title">Отчёт ревью</h1><span id="reportIssueKey" class="issue-key" hidden></span></div>
         </div>
         <div class="report-actions">
-          <button id="copyPath" class="secondary">Скопировать путь</button>
+          <button id="previewJira" class="primary" hidden disabled>Скопировать принятые · 0</button>
+          <button id="openChanges" class="secondary" type="button" hidden>Открыть изменения</button>
           <button id="copyMarkdown" class="secondary">Скопировать Markdown</button>
         </div>
       </header>
-      <section id="error" class="error" hidden></section>
-      <article id="content" class="markdown-body"></article>
+      <div id="reportPath" class="report-path"></div>
+      <section id="error" class="error" role="alert" hidden></section>
+      <div id="statistics" class="statistics" aria-live="polite" hidden></div>
+      <nav id="tabs" class="tabs" aria-label="Разделы отчёта" hidden>
+        <button data-tab="published" aria-pressed="true">Замечания</button>
+        <button data-tab="agentRejected" aria-pressed="false">Отклонено агентом</button>
+        <button data-tab="summary" aria-pressed="false">Итоги</button>
+      </nav>
+      <p id="truncatedWarning" class="warning" hidden>Материал сокращён из-за бюджета токенов. Ревью охватывает только переданный материал.</p>
+      <section id="workspace" class="workspace" hidden>
+        <aside id="findingList" class="finding-list" aria-label="Замечания"></aside>
+        <div id="panelResizer" class="panel-resizer" role="separator" aria-orientation="vertical" aria-label="Ширина списка замечаний" aria-controls="findingList" tabindex="0" title="Потяните для изменения ширины. Двойной щелчок — сброс."></div>
+        <section class="detail-panel" aria-label="Подробности замечания">
+          <article id="details" class="markdown-body details"></article>
+          <section id="decisionPanel" class="decision-panel" hidden>
+            <div class="decision-actions" aria-label="Решение по замечанию">
+              <button id="accept" class="decision-button accept-button"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 4 4L19 6"/></svg>Принять</button>
+              <button id="reject" class="decision-button reject-button"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg>Отклонить</button>
+              <button id="reset" class="subtle">Сбросить</button>
+              <button id="toggleComment" class="comment-toggle" aria-expanded="true" aria-controls="commentEditor"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M21 15a3 3 0 0 1-3 3H8l-5 3V6a3 3 0 0 1 3-3h12a3 3 0 0 1 3 3Z"/></svg><span id="commentToggleLabel">Комментарий</span></button>
+            </div>
+            <div class="save-row"><span id="saveStatus" role="status" aria-live="polite"></span>
+              <button id="retrySave" class="secondary" hidden>Повторить сохранение</button>
+              <button id="reloadReport" class="secondary" hidden>Обновить отчёт</button>
+            </div>
+            <section id="commentEditor" class="comment-editor">
+              <label for="comment">Комментарий для обратной связи <span class="muted">· необязательно</span></label>
+              <textarea id="comment" rows="2" placeholder="Почему вы согласны или не согласны с замечанием"></textarea>
+              <div class="comment-footer"><span id="agentSendStatus" role="status" aria-live="polite"></span><button id="closeComment" class="subtle">Свернуть</button><button id="sendAgent" class="primary">Отправить агенту</button></div>
+            </section>
+          </section>
+        </section>
+      </section>
+      <article id="content" class="markdown-body legacy" hidden></article>
     </main>
+    <dialog id="jiraDialog" aria-labelledby="previewTitle">
+      <header class="preview-header"><h2 id="previewTitle">Принятые замечания для Jira</h2><button id="closePreview" class="secondary">Закрыть</button></header>
+      <p id="clipboardStatus" role="status" aria-live="polite">Проверьте материал перед копированием.</p>
+      <article id="jiraPreview" class="markdown-body preview" tabindex="0"></article>
+      <footer class="preview-actions"><span class="muted">Вставьте скопированный материал в визуальный редактор Jira.</span><button id="copyJira" class="primary">Скопировать</button></footer>
+    </dialog>
     <script src="api.js"></script>
     <script src="ui-feedback.js"></script>
+    <script src="changes-action.js"></script>
     <script src="artifact-page-utils.js"></script>
     <script src="vendor/marked.min.js"></script>
     <script src="report.js"></script>

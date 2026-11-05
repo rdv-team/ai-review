@@ -17,6 +17,7 @@
       branch: $("branch"),
       remote: $("remote"),
       ide: $("ide"),
+      opencodeModel: $("opencodeModel"),
       useMcp: $("useMcp"),
       timeoutSec: $("timeoutSec")
     };
@@ -32,6 +33,11 @@
         formFields[key].value = String(normalized[key]);
       }
     }
+    updateModelVisibility();
+  }
+
+  function updateModelVisibility() {
+    $("opencodeModelField").hidden = $("ide").value !== "opencode";
   }
 
   function showMessage(kind, text) {
@@ -163,6 +169,7 @@
     };
     $("configForm").addEventListener("input", markDirty);
     $("configForm").addEventListener("change", markDirty);
+    $("ide").addEventListener("change", updateModelVisibility);
     $("retryLoad").addEventListener("click", loadConfig);
     await loadConfig();
   }
@@ -176,12 +183,14 @@
       INVALID_PREFIX_MESSAGE,
       SERVICE_ERROR_MESSAGE,
       fillForm,
+      init,
       loadConfig,
       loadPrefixConfig,
       persistPrefixConfig,
       saveConfig,
       setDirty,
       showSaveStatus,
+      updateModelVisibility,
       validateConfig
     };
   }

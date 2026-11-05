@@ -13,6 +13,7 @@ from review_tasks.review_init.comparison import (
     COMPARISON_LAUNCHER, ComparisonLaunchError, launch_comparison,
 )
 from review_tasks.review_result.review_yaml import expand_review_result_inputs, read_review_yaml_documents
+from review_tasks.review_result import FeedbackError, ReviewReportFeature
 
 from .contracts import (
     ApiError,
@@ -81,6 +82,7 @@ class LocalReviewService:
         gitlab_client: GitLabApiClient | None = None,
         file_opener: Callable[[Path], None] | None = None,
         changes_runner: Callable[[Path], None] | None = None,
+        feedback_root: Path | None = None,
     ) -> None:
         if effective_config is None and service_root is not None:
             candidate_config = Path(service_root).expanduser().resolve() / SERVICE_CONFIG_FILENAME
@@ -92,6 +94,7 @@ class LocalReviewService:
                 effective_config = resolve_effective_service_config(cli=config_overrides)
                 cli_overrides = cli_overrides or config_overrides
         self.store = JobStore(service_root)
+        self.report_feature = ReviewReportFeature(feedback_root)
         self.cli_overrides = cli_overrides or CliServiceOverrides()
         self.effective_config = effective_config
         self.token = token if token is not None else os.environ.get("REVIEW_TASKS_SERVICE_TOKEN")
@@ -376,7 +379,41 @@ class LocalReviewService:
         issue_key = status.get("issueKey")
         if isinstance(issue_key, str) and issue_key.strip():
             payload["issueKey"] = issue_key.strip()
+        try:
+            task_dir, task = self._feedback_context(status)
+            payload["view"] = self.report_feature.get_report(task_dir, task)
+        except FeedbackError as exc:
+            payload["view"] = None
+            payload["viewError"] = {"code": exc.code, "message": str(exc)}
         return 200, payload
+
+    @staticmethod
+    def _feedback_context(status: dict[str, Any]) -> tuple[Path, str]:
+        task_dir = status.get("taskDir")
+        task = status.get("issueKey")
+        if not isinstance(task_dir, str) or not task_dir.strip() or not isinstance(task, str) or not task.strip():
+            raise FeedbackError(409, "feedback_unavailable", "Каталог или номер задачи недоступен.")
+        return Path(task_dir).resolve(), task.strip()
+
+    def get_feedback(self, job_id: str) -> tuple[int, dict[str, Any]]:
+        status = self.store.read_status(job_id)
+        if status is None:
+            return 404, structured_error("not_found", f"Unknown jobId: {job_id}")
+        try:
+            task_dir, task = self._feedback_context(status)
+            return 200, self.report_feature.get_feedback(task_dir, task)
+        except FeedbackError as exc:
+            return exc.status, exc.response()
+
+    def put_feedback(self, job_id: str, payload: Any) -> tuple[int, dict[str, Any]]:
+        status = self.store.read_status(job_id)
+        if status is None:
+            return 404, structured_error("not_found", f"Unknown jobId: {job_id}")
+        try:
+            task_dir, task = self._feedback_context(status)
+            return 200, self.report_feature.put_feedback(task_dir, task, payload)
+        except FeedbackError as exc:
+            return exc.status, exc.response()
 
     def get_reasoning(self, job_id: str) -> tuple[int, dict[str, Any]]:
         status = self.store.read_status(job_id)

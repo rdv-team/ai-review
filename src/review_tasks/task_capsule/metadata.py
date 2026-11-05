@@ -97,6 +97,15 @@ def is_mcp_enabled(task_root: Path) -> bool:
     return values.get("mcp_mode") != "off"
 
 
+def read_input_truncated(task_root: Path) -> bool | None:
+    """Read the coverage flag; legacy or invalid values mean unknown coverage."""
+    try:
+        value = _read_meta_values(_meta_path(task_root)).get("input_truncated")
+    except TaskMetadataError:
+        return None
+    return {"true": True, "false": False}.get(value)
+
+
 def _utc_timestamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 

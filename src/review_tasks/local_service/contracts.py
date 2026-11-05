@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ipaddress
 import re
+import unicodedata
 from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
@@ -436,11 +437,29 @@ def normalize_review_request(value: Any) -> dict[str, Any]:
     return result
 
 
+def normalize_opencode_model(value: Any) -> str:
+    if not isinstance(value, str):
+        raise ApiError("invalid_prefix_config", "opencodeModel must be a string.")
+    model = value.strip()
+    if not model:
+        return ""
+    provider, separator, model_id = model.partition("/")
+    if (not separator or not provider or not model_id
+            or any(char.isspace() or unicodedata.category(char).startswith("C") for char in model)):
+        raise ApiError(
+            "invalid_prefix_config",
+            "opencodeModel must use provider/model with non-empty parts and no whitespace or control characters.",
+        )
+    return model
+
+
 def normalize_prefix_payload(value: Any) -> dict[str, Any]:
     payload = require_object(value, code="invalid_prefix_config")
-    allowed = {"repoPath", "reviewsRoot", "branch", "remote", "ide", "timeoutSec", "useMcp"}
+    allowed = {"repoPath", "reviewsRoot", "branch", "remote", "ide", "timeoutSec", "useMcp", "opencodeModel"}
     reject_forbidden_fields(payload, allowed, path="$")
     result: dict[str, Any] = {}
+    if "opencodeModel" in payload:
+        result["opencodeModel"] = normalize_opencode_model(payload["opencodeModel"])
     use_mcp = payload.get("useMcp", True)
     if not isinstance(use_mcp, bool):
         raise ApiError("invalid_prefix_config", "useMcp must be a boolean.")
@@ -473,6 +492,7 @@ def prefix_entry_to_api(prefix: str, entry: dict[str, Any]) -> dict[str, Any]:
         "branch": entry.get("branch"),
         "remote": entry.get("remote", "origin"),
         "useMcp": entry.get("mcp_enabled", True),
+        "opencodeModel": entry.get("opencode_model", ""),
     }
     ide = entry.get("ide")
     if ide in ALLOWED_IDES:
@@ -492,6 +512,8 @@ def prefix_entry_from_api(config: dict[str, Any]) -> dict[str, Any]:
         "mcp_enabled": config.get("useMcp", True),
     }
     ide = config.get("ide")
+    if "opencodeModel" in config:
+        entry["opencode_model"] = config["opencodeModel"]
     if ide in ALLOWED_IDES:
         entry["ide"] = ide
     if "timeoutSec" in config:

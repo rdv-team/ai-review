@@ -12,11 +12,13 @@
   <body>
     <main class="popup">
       <header class="topbar">
-        <div>
-          <div id="issueKey" class="issue-key">JIRA</div>
-          <div id="issueTitle" class="issue-title"></div>
+        <div id="issueKey" class="issue-key">JIRA</div>
+        <div class="brand">
+          <img class="brand-logo" src="icons/rdv-swift.svg" alt="" width="32" height="32">
+          <span class="brand-name">RDV <em>AIR</em></span>
         </div>
         <button id="refreshButton" class="icon-button" title="Обновить" aria-label="Обновить">↻</button>
+        <div id="issueTitle" class="issue-title"></div>
       </header>
 
       <section class="status-band" id="statusBand">
@@ -132,6 +134,7 @@
     <script src="api.js"></script>
     <script src="prefix-config.js"></script>
     <script src="ui-feedback.js"></script>
+    <script src="changes-action.js"></script>
     <script src="artifact-page-utils.js"></script>
     <script src="popup.js"></script>
   </body>

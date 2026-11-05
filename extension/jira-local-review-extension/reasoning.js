@@ -94,7 +94,6 @@
       const codeEl = $("contentCode");
       codeEl.innerHTML = renderYaml(yamlSource);
       codeEl.classList.add("hljs");
-      $("copyPath").addEventListener("click", () => handleCopyClick($("copyPath"), reasoning.reasoningPath || ""));
       $("copyYaml").addEventListener("click", () => handleCopyClick($("copyYaml"), yamlSource));
     } catch (error) {
       renderError(error.message || String(error));

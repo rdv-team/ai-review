@@ -1,31 +1,19 @@
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import threading
 import uuid
 from pathlib import Path
 from typing import Any
 
+from review_tasks.infrastructure.json_files import write_json
+
 from .contracts import is_active_status, now_iso, safe_index_name
 
 
 def default_service_root() -> Path:
     return Path.home() / ".review-tasks" / "local-service"
-
-
-def write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
-    normalized = text.replace("\r\n", "\n").replace("\r", "\n").encode("utf-8")
-    temp_path = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
-    try:
-        temp_path.write_bytes(normalized)
-        os.replace(temp_path, path)
-    finally:
-        if temp_path.exists():
-            temp_path.unlink(missing_ok=True)
 
 
 def compact_request_for_storage(request: dict[str, Any]) -> dict[str, Any]:

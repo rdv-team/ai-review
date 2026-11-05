@@ -2,6 +2,9 @@
 (function popupMain(root) {
   "use strict";
 
+  const changesAction = root.RdvChangesAction || (typeof require !== "undefined" ? require("./changes-action.js") : null);
+  const openChanges = changesAction.openChanges;
+
   const state = {
     context: null,
     config: null,
@@ -615,7 +618,7 @@
       openAgentLogHidden:
         !["review_running", "done"].includes(status.detailStatus) || !hasText(status.jobId) || !actions.includes("open_agent_log"),
       openChangesHidden:
-        !hasText(status.jobId) || !actions.includes("open_changes"),
+        !changesAction.canOpenChanges(status),
       openReportHidden: !actions.includes("open_report") || !status.reportPath,
       openReasoningHidden: !actions.includes("open_reasoning") || !status.reasoningPath,
       summaryHidden: !status.summary,
@@ -1353,22 +1356,6 @@
   function handleOpenAgentLog() {
     const jobId = state.status && state.status.jobId;
     return openAgentLog(state.api, jobId, $("openAgentLog"));
-  }
-
-  async function openChanges(apiClient, jobId, button, feedbackFn) {
-    if (!apiClient || !jobId || !button || button.disabled) {
-      return false;
-    }
-    const showFeedback = feedbackFn || root.RdvUiFeedback.flashButtonFeedback;
-    button.disabled = true;
-    try {
-      await apiClient.openChanges(jobId);
-      showFeedback(button, { success: true, successLabel: "✓" });
-      return true;
-    } catch {
-      showFeedback(button, { success: false, failLabel: "×" });
-      return false;
-    }
   }
 
   function handleOpenChanges() {

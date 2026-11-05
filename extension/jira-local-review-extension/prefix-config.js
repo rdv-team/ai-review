@@ -7,6 +7,7 @@
     branch: "origin/master",
     remote: "origin",
     ide: "codex",
+    opencodeModel: "",
     useMcp: true,
     timeoutSec: 1800
   });
@@ -53,6 +54,7 @@
       branch: typeof value.branch === "string" ? value.branch.trim() : DEFAULT_CONFIG.branch,
       remote: typeof value.remote === "string" ? value.remote.trim() : DEFAULT_CONFIG.remote,
       ide: ALLOWED_IDES.has(value.ide) ? value.ide : DEFAULT_CONFIG.ide,
+      opencodeModel: typeof value.opencodeModel === "string" ? value.opencodeModel.trim() : "",
       useMcp: typeof value.useMcp === "boolean" ? value.useMcp : DEFAULT_CONFIG.useMcp,
       timeoutSec: Number.isFinite(timeoutSec) && timeoutSec > 0 ? timeoutSec : DEFAULT_CONFIG.timeoutSec
     };
@@ -65,6 +67,7 @@
       branch: fields.branch.value,
       remote: fields.remote.value,
       ide: fields.ide.value,
+      opencodeModel: fields.opencodeModel.value,
       useMcp: fields.useMcp.checked,
       timeoutSec: fields.timeoutSec.value
     });
