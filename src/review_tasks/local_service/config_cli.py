@@ -23,6 +23,7 @@ _CONFIG_WRITE_FLAGS: tuple[tuple[str, str, str], ...] = (
     ("--codex-bin", "codex_bin", "codexBin"),
     ("--cursor-bin", "cursor_bin", "cursorBin"),
     ("--opencode-bin", "opencode_bin", "opencodeBin"),
+    ("--opencode-cli-version", "opencode_cli_version", "opencodeCliVersion"),
     ("--cursor-model", "cursor_model", "cursorModel"),
     ("--log-file", "log_file", "logFile"),
     ("--max-concurrent-reviews", "max_concurrent_reviews", "maxConcurrentReviews"),
@@ -37,6 +38,7 @@ _SHOW_FIELDS: tuple[str, ...] = (
     "codex_bin",
     "cursor_bin",
     "opencode_bin",
+    "opencode_cli_version",
     "cursor_model",
     "log_file",
     "max_concurrent_reviews",
@@ -61,6 +63,10 @@ def build_config_parser() -> argparse.ArgumentParser:
     parser.add_argument("--codex-bin", default=None, help="Path to Codex CLI binary.")
     parser.add_argument("--cursor-bin", default=None, help="Path to Cursor Agent CLI binary.")
     parser.add_argument("--opencode-bin", default=None, help="Path to OpenCode CLI binary.")
+    parser.add_argument(
+        "--opencode-cli-version", choices=("v1", "v2"), default=None,
+        help="OpenCode CLI generation (default: v2); requires service restart.",
+    )
     parser.add_argument("--cursor-model", default=None, help="Cursor Agent model name.")
     parser.add_argument("--log-file", default=None, help="Path to plain-text service event log file.")
     parser.add_argument("--max-concurrent-reviews", type=int, default=None, help="Max concurrent review jobs.")

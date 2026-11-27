@@ -16,7 +16,7 @@ from review_tasks.review_result.stage1_storage import STAGE1_NAME, STAGE2_NAME, 
 
 
 _CANDIDATE_RE = re.compile(r"^candidate-[1-9][0-9]*$")
-_TOP_LEVEL_KEYS = ("findings", "summary", "questions_to_author", "missing_context")
+_TOP_LEVEL_KEYS = ("findings", "missing_context")
 
 
 class _LiteralString(str):
@@ -45,8 +45,6 @@ def stage2_path(cwd: Path | None = None) -> Path:
 def _empty_draft() -> dict[str, Any]:
     return {
         "findings": [],
-        "summary": None,
-        "questions_to_author": [],
         "missing_context": [],
     }
 
@@ -54,17 +52,19 @@ def _empty_draft() -> dict[str, Any]:
 def _validate_top_level(raw: Any, *, source: str) -> dict[str, Any]:
     if not isinstance(raw, dict):
         raise _error(f"{source}: Stage 2 YAML должен быть объектом верхнего уровня.")
+    if "questions_to_author" in raw:
+        raise _error(
+            f"{source}: несовместимый прежний формат Stage 2 с `questions_to_author`. "
+            "Повторно подготовьте каталог и выполните ревью с новыми шаблонами."
+        )
     if set(raw) != set(_TOP_LEVEL_KEYS):
         raise _error(
             f"{source}: Stage 2 должен содержать только поля: {', '.join(_TOP_LEVEL_KEYS)}."
         )
     if not isinstance(raw["findings"], list):
         raise _error(f"{source}: поле `findings` должно быть списком.")
-    if raw["summary"] is not None and not isinstance(raw["summary"], str):
-        raise _error(f"{source}: поле `summary` должно быть строкой или null.")
-    for field in ("questions_to_author", "missing_context"):
-        if not isinstance(raw[field], list):
-            raise _error(f"{source}: поле `{field}` должно быть списком.")
+    if not isinstance(raw["missing_context"], list):
+        raise _error(f"{source}: поле `missing_context` должно быть списком.")
     return raw
 
 
@@ -125,10 +125,10 @@ def _write_atomic(path: Path, data: dict[str, Any]) -> None:
 
 
 def _save_if_changed(before: dict[str, Any], after: dict[str, Any], *, cwd: Path | None) -> bool:
-    changed = before != after
+    path = stage2_path(cwd)
+    changed = before != after or not path.exists()
     if not changed:
         return False
-    path = stage2_path(cwd)
     if not path.parent.is_dir():
         raise _error(f"Не найден каталог _review_info: {path.parent}")
     try:
@@ -251,9 +251,14 @@ def upsert_finding(
     alternative_interpretation: str | None = None, drop_reason: str | None = None,
     severity: str | None = None, suggestion_text: str | None = None,
     suggestion_code_file: str | None = None, reset_details: bool = False,
+    question_to_author: str | None = None,
     cwd: Path | None = None,
 ) -> bool:
     identity = _stage1_candidate(candidate, cwd=cwd)
+    if question_to_author is not None and (
+        not isinstance(question_to_author, str) or not question_to_author.strip()
+    ):
+        raise _error("`--question-to-author` должен быть непустой строкой.")
     if isinstance(start_line, bool) or isinstance(end_line, bool) or start_line <= 0 or end_line <= 0:
         raise _error("start_line и end_line должны быть положительными целыми числами.")
     if start_line > end_line:
@@ -291,6 +296,7 @@ def upsert_finding(
         "start_line": start_line,
         "end_line": end_line,
         "observation": observation,
+        "question_to_author": question_to_author,
         "source": source,
         "confidence": confidence,
         "self_check": {
@@ -379,13 +385,10 @@ def upsert_trace(
 
 
 def set_result(
-    *, summary: str, questions: list[str] | None = None,
-    missing_context: list[str] | None = None, cwd: Path | None = None,
+    *, missing_context: list[str] | None = None, cwd: Path | None = None,
 ) -> bool:
     before = load_stage2(cwd=cwd)
     after = copy.deepcopy(before)
-    after["summary"] = summary
-    after["questions_to_author"] = list(questions or [])
     after["missing_context"] = list(missing_context or [])
     return _save_if_changed(before, after, cwd=cwd)
 

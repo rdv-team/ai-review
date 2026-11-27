@@ -23,6 +23,7 @@ body {
 .popup {
   display: grid;
   gap: 10px;
+  overflow: hidden;
   padding: 12px;
 }
 
@@ -49,6 +50,26 @@ body {
   height: 32px;
   object-fit: contain;
   width: 32px;
+}
+
+.brand-logo.swift-flying {
+  animation: swift-flight 2.7s linear;
+}
+
+@keyframes swift-flight {
+  0% { transform: translate(0, 0) rotate(0); opacity: 1; }
+  8% { transform: translate(-5px, 3px) rotate(8deg); opacity: 1; }
+  18% { transform: translate(24px, -6px) rotate(-12deg); opacity: 1; }
+  33% { transform: translate(180px, -72px) rotate(-20deg); opacity: 0; }
+  84% { transform: translate(180px, -72px) rotate(-20deg); opacity: 0; }
+  85% { transform: translate(0, 0) rotate(0); opacity: 0; }
+  100% { transform: translate(0, 0) rotate(0); opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .brand-logo.swift-flying {
+    animation: none;
+  }
 }
 
 .brand-name {
@@ -498,15 +519,6 @@ textarea {
   display: grid;
   gap: 6px 12px;
   grid-template-columns: 1fr auto;
-  padding: 10px;
-}
-
-.summary-text {
-  background: #ffffff;
-  border: 1px solid #b8d9e1;
-  border-radius: 7px;
-  color: var(--brand-navy);
-  line-height: 1.4;
   padding: 10px;
 }
 

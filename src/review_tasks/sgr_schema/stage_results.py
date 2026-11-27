@@ -62,8 +62,6 @@ class ReviewStage1Result(SgrBaseModel):
 
 class ReviewStage2Result(SgrBaseModel):
     findings: list[Finding]
-    summary: str
-    questions_to_author: list[str]
     missing_context: list[str]
 
 
@@ -73,8 +71,6 @@ class ReviewResponse(SgrBaseModel):
     # Field declaration order is the persisted compatibility contract.
     risk_candidates: RiskCandidates
     findings: list[Finding]
-    summary: str
-    questions_to_author: list[str]
     missing_context: list[str]
 
     @model_validator(mode="after")

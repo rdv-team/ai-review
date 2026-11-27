@@ -1,0 +1,24 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "routerai/deepseek/deepseek-v4.1-flash-1017",
+  "websearch": {
+    "provider": "random"
+  },
+  "providers": {
+    "routerai": {
+      "package": "@opencode/ai/providers/openai-compatible",
+      "settings": {
+        "baseURL": "https://routerai.ru/api/v1",
+        "apiKey": "{env:ROUTERAI_API_KEY}"
+      },
+      "models": {
+        "deepseek/deepseek-v4.1-flash-1017": {
+          "name": "DeepSeek V4.1 Flash",
+          "compatibility": {
+            "reasoningField": "reasoning_content"
+          }
+        }
+      }
+    }
+  }
+}

@@ -93,6 +93,12 @@
       return this.request("/reviews", { method: "POST", body: JSON.stringify(payload) });
     }
 
+    getCommitCandidates(issueKey, init, refresh = true) {
+      return this.request("/reviews/commit-candidates", {
+        method: "POST", body: JSON.stringify({ issueKey, refresh, ...(init ? { init } : {}) })
+      });
+    }
+
     refreshStatus(jobId) {
       return this.request(`/reviews/${encodeURIComponent(jobId)}/status`, { method: "GET" });
     }
@@ -101,13 +107,33 @@
       return this.request(`/reviews/${encodeURIComponent(jobId)}/report`, { method: "GET" });
     }
 
-    getFeedback(jobId) {
-      return this.request(`/reviews/${encodeURIComponent(jobId)}/feedback`, { method: "GET" });
+    getReportVersions(jobId) {
+      return this.request(`/reviews/${encodeURIComponent(jobId)}/report-versions`, { method: "GET" });
     }
 
-    saveFeedback(jobId, feedback) {
-      return this.request(`/reviews/${encodeURIComponent(jobId)}/feedback`, {
-        method: "PUT", body: JSON.stringify(feedback)
+    getReportVersion(jobId, versionId) {
+      return this.request(`/reviews/${encodeURIComponent(jobId)}/report-versions/${encodeURIComponent(versionId)}`, { method: "GET" });
+    }
+
+    openDiscussion(jobId, context = {}) {
+      return this.request(`/reviews/${encodeURIComponent(jobId)}/discussion`, {
+        method: "POST", body: JSON.stringify(context)
+      });
+    }
+
+    getReportState(jobId) {
+      return this.request(`/reviews/${encodeURIComponent(jobId)}/report-state`, { method: "GET" });
+    }
+
+    saveReportState(jobId, reportState) {
+      return this.request(`/reviews/${encodeURIComponent(jobId)}/report-state`, {
+        method: "PUT", body: JSON.stringify(reportState)
+      });
+    }
+
+    saveReportSuggestion(jobId, suggestion) {
+      return this.request(`/reviews/${encodeURIComponent(jobId)}/report-suggestion`, {
+        method: "PUT", body: JSON.stringify(suggestion)
       });
     }
 

@@ -4,7 +4,7 @@ import json
 import os
 import re
 import shlex
-import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -20,6 +20,8 @@ from review_tasks.integrations.mcp_registry import (
     mcp_bearer_env_var_names,
     mcp_url_env_var_names,
 )
+from review_tasks.infrastructure.executables import resolve_executable
+from review_tasks.integrations import opencode
 from review_tasks.review_init import prefix_config
 from review_tasks.review_result.review_yaml import expand_review_result_inputs, read_review_yaml_documents
 
@@ -27,6 +29,7 @@ from .contracts import ApiError, DETAIL_TEXT, actions_for, normalize_opencode_mo
 from .gitlab import GitLabInstance, GitRemoteCommandOutput, normalize_gitlab_project_path, resolve_git_remote
 from .job_logs import build_detail_diagnostics, build_log_diagnostics
 from .logging_setup import log_agent_end, log_agent_start, log_error, log_init_end, log_init_start
+from .opencode_log import OpenCodeReadableLog, READABLE_LOG_FILENAME
 from .problem_details import (
     InitResultProtocolError,
     build_feedback,
@@ -44,7 +47,6 @@ CURSOR_DEFAULT_MODEL = "composer-2.5-fast"
 CURSOR_FALLBACK_MODEL = "composer-2.5"
 CURSOR_REVIEW_PROMPT = "Выполни /review-start-task"
 OPENCODE_REVIEW_COMMAND = "review-start-task"
-OPENCODE_REQUIRED_COMMON_RUN_FLAGS = ("--command", "--dir")
 OPENCODE_PERMISSION_APPROVAL_FLAGS = ("--auto", "--dangerously-skip-permissions")
 OPENCODE_AUTH_ENV_VARS = (
     "ANTHROPIC_API_KEY",
@@ -53,6 +55,8 @@ OPENCODE_AUTH_ENV_VARS = (
     "GOOGLE_API_KEY",
     "OPENROUTER_API_KEY",
     "ROUTERAI_API_KEY",
+    "ROUTERAI_DEEPSEEK_API_KEY",
+    "ROUTERAI_CLAUDE_API_KEY",
 )
 
 
@@ -108,16 +112,25 @@ class CommandBackend:
         stdout_path.parent.mkdir(parents=True, exist_ok=True)
         stderr_path.parent.mkdir(parents=True, exist_ok=True)
         with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
-            result = subprocess.run(
+            standalone = "--standalone" in argv
+            process = subprocess.Popen(
                 argv,
                 cwd=str(cwd),
                 env=env,
                 stdout=stdout,
                 stderr=stderr,
-                timeout=timeout,
-                check=False,
+                stdin=subprocess.DEVNULL,
+                start_new_session=standalone and os.name != "nt",
             )
-        return CommandResult(result.returncode)
+            if standalone and os.name != "nt":
+                process._review_tasks_process_group = process.pid
+            try:
+                returncode = process.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                terminate_process_tree(process)
+                process.wait(timeout=5)
+                raise
+        return CommandResult(returncode)
 
     def start(
         self,
@@ -131,14 +144,20 @@ class CommandBackend:
         stdout_path.parent.mkdir(parents=True, exist_ok=True)
         stderr_path.parent.mkdir(parents=True, exist_ok=True)
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform.startswith("win") else 0
-        return subprocess.Popen(
+        standalone = argv[1:2] == ["run"] and "--standalone" in argv
+        process = subprocess.Popen(
             argv,
             cwd=str(cwd),
             env=env,
             stdout=stdout_path.open("wb"),
             stderr=stderr_path.open("wb"),
+            stdin=subprocess.DEVNULL if standalone else None,
             creationflags=creationflags,
+            start_new_session=standalone and os.name != "nt",
         )
+        if standalone and os.name != "nt":
+            process._review_tasks_process_group = process.pid
+        return process
 
 
 class PreflightError(RuntimeError):
@@ -156,11 +175,13 @@ class JobOrchestrator:
         backend: CommandBackend | None = None,
         poll_interval: float = 2.0,
         gitlab_instances: tuple[GitLabInstance, ...] = (),
+        opencode_cli_version: str = "v2",
     ) -> None:
         self.store = store
         self.backend = backend or CommandBackend()
         self.poll_interval = poll_interval
         self.gitlab_instances = gitlab_instances
+        self.opencode_cli_version = opencode_cli_version
         self._processes: dict[str, ProcessLike] = {}
         self._processes_lock = threading.Lock()
         self._reattach_job_ids: set[str] = set()
@@ -249,6 +270,14 @@ class JobOrchestrator:
         request = self.store.read_request(job_id)
         detail_status = str(status.get("detailStatus") or "")
         runner_logs = _runner_log_paths(run_dir, str(request.get("ide") or "codex"))
+        readable_log = None
+        if request.get("ide") == "opencode" and status.get("opencodeCliVersion") == "v2":
+            argv = status.get("opencodeArgv") or []
+            executable = argv[0] if isinstance(argv, list) and argv and isinstance(argv[0], str) else None
+            readable_log = OpenCodeReadableLog(
+                runner_logs["stdout"], runner_logs["stderr"], run_dir / READABLE_LOG_FILENAME, executable=executable,
+            )
+            readable_log.update()
         started = time.monotonic()
         timeout_sec = int(request.get("timeoutSec") or 1800)
         try:
@@ -261,6 +290,7 @@ class JobOrchestrator:
                 runner_logs.get("final"),
                 timeout_sec,
                 started,
+                readable_log=readable_log,
             )
         finally:
             with self._processes_lock:
@@ -378,6 +408,36 @@ class JobOrchestrator:
                 )
                 return
 
+            selection = getattr(init_contract, "commit_selection", None)
+            if selection is not None:
+                if hasattr(selection, "model_dump"):
+                    selection = selection.model_dump(mode="json", by_alias=True)
+                selection = dict(selection)
+                from review_tasks.review_init.commit_source import normalize_after_commits
+
+                requested_boundaries = (request.get("init") or {}).get("afterCommits")
+                expected_mode = "after" if requested_boundaries else "all"
+                requested_init = request.get("init") or {}
+                expected_source = {"mode": "mr", "mrId": requested_init["mrId"]} if requested_init.get("mrId") else {"mode": "task"}
+                if isinstance(request.get("source"), dict):
+                    expected_source.update({key: request["source"][key] for key in ("mode", "mrId", "gitlabInstanceId", "gitlabProjectPath")
+                                            if key in request["source"]})
+                actual_source = selection.get("source") or {}
+                source_matches = all(actual_source.get(key) == value for key, value in expected_source.items())
+                if selection.get("task") != request["issueKey"] or not source_matches or selection.get("mode") != expected_mode or (requested_boundaries and
+                        normalize_after_commits(selection.get("boundaries"), Path.cwd()) !=
+                        normalize_after_commits(requested_boundaries, Path.cwd())):
+                    self._fail(job_id, "init_result_protocol_error", "Init returned a different requested commit scope.",
+                               detail_status="init_failed")
+                    return
+                request["commitSelection"] = selection
+                self.store.write_request(job_id, request)
+                self.store.update_status(job_id, commitSelection=selection)
+            elif (request.get("init") or {}).get("afterCommits") and init_contract.outcome == "success":
+                self._fail(job_id, "init_result_protocol_error", "Limited init did not return its effective commit scope.",
+                           detail_status="init_failed")
+                return
+
             comparisons = getattr(init_contract, "comparisons", [])
             expected_dir = Path(str(resolved_init["reviewsRoot"])) / str(resolved_init.get("reviewDirName") or request["issueKey"])
             matching = [item for item in comparisons if item.task == request["issueKey"]
@@ -414,7 +474,10 @@ class JobOrchestrator:
             task_dir = Path(task_dir_value).resolve() if task_dir_value else detect_task_dir(
                 init_stdout, request["issueKey"], resolved_init
             )
-            artifact_error = verify_init_artifacts(task_dir, ide=request["ide"], mcp_mode=resolved_init["mcpMode"])
+            artifact_error = verify_init_artifacts(
+                task_dir, ide=request["ide"], mcp_mode=resolved_init["mcpMode"],
+                opencode_cli_version=self.opencode_cli_version,
+            )
             if artifact_error:
                 init_outcome = "failed"
                 self._fail(
@@ -455,7 +518,8 @@ class JobOrchestrator:
                 detailText=DETAIL_TEXT["handoff_required"],
                 availableActions=["submit", "refresh"],
                 manualCommand=build_manual_runner_command(
-                    request["ide"], task_dir, opencode_model=resolved_init["opencodeModel"]
+                    request["ide"], task_dir, opencode_model=resolved_init["opencodeModel"],
+                    cli_version=self.opencode_cli_version,
                 ),
                 error=None,
             )
@@ -531,7 +595,7 @@ class JobOrchestrator:
                 run_dir,
                 f"git-repo-{index}",
             )
-        selected_source = self._resolve_selected_mr_source(job_id, request, resolved, repo_paths, run_dir)
+        selected_source = self.resolve_selected_mr_source(request, resolved, repo_paths, run_dir=run_dir)
         if selected_source is not None:
             resolved["repoPath"] = selected_source["repoPath"]
             resolved["reviewDirName"] = selected_source["reviewDirName"]
@@ -578,13 +642,13 @@ class JobOrchestrator:
         self.store.update_status(job_id, source=selected_source)
         return request
 
-    def _resolve_selected_mr_source(
+    def resolve_selected_mr_source(
         self,
-        job_id: str,
         request: dict[str, Any],
         resolved: dict[str, Any],
         repo_paths: list[Path],
-        run_dir: Path,
+        *,
+        run_dir: Path | None = None,
     ) -> dict[str, Any] | None:
         init = request.get("init") or {}
         if not (init.get("mrId") and init.get("mrUrl") and init.get("gitlabProjectPath")):
@@ -604,10 +668,10 @@ class JobOrchestrator:
         checked: list[dict[str, Any]] = []
         matches: list[dict[str, Any]] = []
         for index, repo_path in enumerate(repo_paths, start=1):
-            stdout = run_dir / f"preflight.git-remote-{index}.stdout.log"
-            stderr = run_dir / f"preflight.git-remote-{index}.stderr.log"
-
             def run_git_remote(argv: list[str], timeout_sec: int) -> GitRemoteCommandOutput:
+                assert run_dir is not None
+                stdout = run_dir / f"preflight.git-remote-{index}.stdout.log"
+                stderr = run_dir / f"preflight.git-remote-{index}.stderr.log"
                 result = self.backend.run(
                     argv,
                     cwd=run_dir,
@@ -627,7 +691,7 @@ class JobOrchestrator:
                 remote,
                 self.gitlab_instances,
                 git_bin=git_bin,
-                runner=run_git_remote,
+                runner=run_git_remote if run_dir is not None else None,
             )
             item: dict[str, Any] = {"repoPath": str(repo_path)}
             if lookup.error is None:
@@ -724,18 +788,25 @@ class JobOrchestrator:
 
     def _preflight_opencode(self, job_id: str, run_dir: Path, model: str = "") -> dict[str, Any]:
         opencode_bin = self._resolve_executable("opencode", "REVIEW_TASKS_OPENCODE_BIN")
-        self._preflight_command(job_id, [str(opencode_bin), "--version"], run_dir, "opencode")
+        self.store.update_status(job_id, opencodeCliVersion=self.opencode_cli_version)
+        version_output = self._preflight_command(job_id, [str(opencode_bin), "--version"], run_dir, "opencode")
+        self.store.update_status(job_id, opencodeVersion=version_output.strip())
+        try:
+            version = opencode.validate_version(version_output, self.opencode_cli_version)
+        except ValueError as exc:
+            raise PreflightError("preflight_failed", str(exc), details={
+                "opencodeCliVersion": self.opencode_cli_version, "opencodeVersion": version_output.strip(),
+            }) from exc
+        self.store.update_status(job_id, opencodeVersion=version)
         help_text = self._preflight_command(job_id, [str(opencode_bin), "run", "--help"], run_dir, "opencode-run-help")
-        missing = [flag for flag in OPENCODE_REQUIRED_COMMON_RUN_FLAGS if flag not in help_text]
-        if model and "--model" not in help_text:
-            missing.append("--model")
+        missing = [flag for flag in opencode.required_run_flags(self.opencode_cli_version, model) if flag not in help_text]
         if missing:
             raise PreflightError(
                 "preflight_failed",
-                f"OpenCode CLI is missing required flag(s): {', '.join(missing)}.",
+                f"OpenCode CLI capability preflight failed: opencode run --help is missing required flag(s): {', '.join(missing)}.",
                 details={"missingFlags": missing},
             )
-        permission_approval_flag = select_opencode_permission_approval_flag(help_text)
+        permission_approval_flag = "--auto" if self.opencode_cli_version == "v2" else select_opencode_permission_approval_flag(help_text)
         if permission_approval_flag is None:
             raise PreflightError(
                 "preflight_failed",
@@ -745,11 +816,20 @@ class JobOrchestrator:
                 details={"supportedPermissionApprovalFlags": list(OPENCODE_PERMISSION_APPROVAL_FLAGS)},
             )
         auth_code, auth_text, stdout_path, stderr_path = self._preflight_probe(
-            [str(opencode_bin), "auth", "list"],
+            opencode.auth_argv(str(opencode_bin), self.opencode_cli_version),
             run_dir,
             "opencode-auth-list",
         )
-        if not opencode_auth_list_has_credentials(auth_code, auth_text) and not has_opencode_provider_auth_env():
+        try:
+            if self.opencode_cli_version == "v2" and auth_code != 0:
+                raise ValueError("OpenCode auth list завершился ошибкой.")
+            authenticated = auth_code == 0 and opencode.has_auth(auth_text, self.opencode_cli_version)
+        except ValueError as exc:
+            raise PreflightError("preflight_failed", str(exc), details={
+                "stdoutPath": str(stdout_path), "stderrPath": str(stderr_path),
+                "stderrTail": safe_tail(stderr_path),
+            }) from exc
+        if not authenticated and not has_opencode_provider_auth_env():
             raise PreflightError(
                 "preflight_failed",
                 "OpenCode: нет настроенных провайдеров. Выполните `opencode auth login` "
@@ -861,6 +941,10 @@ class JobOrchestrator:
                 stderr_path=stderr,
                 timeout=30,
             )
+        except subprocess.TimeoutExpired as exc:
+            raise PreflightError("preflight_failed", f"Preflight command timed out: {name}", details={
+                "stdoutPath": str(stdout), "stderrPath": str(stderr),
+            }) from exc
         except OSError as exc:
             raise PreflightError("preflight_failed", f"Command not available: {argv[0]}") from exc
         if result.returncode != 0:
@@ -883,9 +967,15 @@ class JobOrchestrator:
                 stderr_path=stderr,
                 timeout=30,
             )
+        except subprocess.TimeoutExpired as exc:
+            raise PreflightError("preflight_failed", f"Preflight command timed out: {name}", details={
+                "stdoutPath": str(stdout), "stderrPath": str(stderr),
+            }) from exc
         except OSError:
             return 127, "", stdout, stderr
-        text = "\n".join(part for part in (read_text_safe(stdout), read_text_safe(stderr)) if part)
+        text = read_text_safe(stdout) if name == "opencode-auth-list" and self.opencode_cli_version == "v2" else "\n".join(
+            part for part in (read_text_safe(stdout), read_text_safe(stderr)) if part
+        )
         return result.returncode, text, stdout, stderr
 
     def _run_codex(
@@ -1033,12 +1123,12 @@ class JobOrchestrator:
         self._check_cancel(job_id)
         stdout = run_dir / "opencode.stdout.log"
         stderr = run_dir / "opencode.stderr.log"
-        argv = build_opencode_argv(
+        argv = opencode.headless_argv(
+            opencode_bin,
             task_dir,
-            run_dir,
-            executable=opencode_bin,
-            permission_approval_flag=permission_approval_flag,
             model=model,
+            cli_version=self.opencode_cli_version,
+            auto_flag=permission_approval_flag,
         )
         self.store.update_status(
             job_id,
@@ -1049,6 +1139,10 @@ class JobOrchestrator:
             opencodeArgv=argv,
         )
         log_agent_start(request["issueKey"], "opencode", argv)
+        readable_log = None
+        if self.opencode_cli_version == "v2":
+            readable_log = OpenCodeReadableLog(stdout, stderr, run_dir / READABLE_LOG_FILENAME, executable=opencode_bin)
+            readable_log.update()
         process = self.backend.start(argv, cwd=task_dir, env=controlled_env(), stdout_path=stdout, stderr_path=stderr)
         with self._processes_lock:
             self._processes[job_id] = process
@@ -1071,7 +1165,8 @@ class JobOrchestrator:
         )
         started = time.monotonic()
         try:
-            returncode = self._wait_process(job_id, process, run_dir, stdout, stderr, None, request["timeoutSec"], started)
+            returncode = self._wait_process(job_id, process, run_dir, stdout, stderr, None, request["timeoutSec"], started,
+                                            readable_log=readable_log)
         finally:
             with self._processes_lock:
                 self._processes.pop(job_id, None)
@@ -1109,28 +1204,36 @@ class JobOrchestrator:
         final_path: Path | None,
         timeout_sec: int,
         started: float,
+        *,
+        readable_log: OpenCodeReadableLog | None = None,
     ) -> int:
-        while True:
-            self._check_cancel(job_id, process)
-            returncode = process.poll()
-            update_heartbeat(job_id, run_dir, process, stdout, stderr, final_path)
-            if returncode is not None:
-                return returncode
-            if time.monotonic() - started > timeout_sec:
-                terminate_process_tree(process)
-                issue_key = str((self.store.read_status(job_id) or {}).get("issueKey") or job_id)
-                log_error(issue_key, "review timeout exceeded")
-                self.store.update_status(
-                    job_id,
-                    status="timeout",
-                    detailStatus="timeout",
-                    detailText=DETAIL_TEXT["timeout"],
-                    availableActions=["retry", "refresh"],
-                    finishedAt=now_iso(),
-                    error={"code": "timeout", "message": "Review process exceeded timeoutSec."},
-                )
-                return 124
-            time.sleep(self.poll_interval)
+        try:
+            while True:
+                self._check_cancel(job_id, process)
+                returncode = process.poll()
+                update_heartbeat(job_id, run_dir, process, stdout, stderr, final_path)
+                if readable_log is not None:
+                    readable_log.update()
+                if returncode is not None:
+                    return returncode
+                if time.monotonic() - started > timeout_sec:
+                    terminate_process_tree(process)
+                    issue_key = str((self.store.read_status(job_id) or {}).get("issueKey") or job_id)
+                    log_error(issue_key, "review timeout exceeded")
+                    self.store.update_status(
+                        job_id,
+                        status="timeout",
+                        detailStatus="timeout",
+                        detailText=DETAIL_TEXT["timeout"],
+                        availableActions=["retry", "refresh"],
+                        finishedAt=now_iso(),
+                        error={"code": "timeout", "message": "Review process exceeded timeoutSec."},
+                    )
+                    return 124
+                time.sleep(self.poll_interval)
+        finally:
+            if readable_log is not None:
+                readable_log.update(final=True)
 
     def _postprocess(
         self,
@@ -1365,14 +1468,14 @@ def controlled_env() -> dict[str, str]:
     return env
 
 
-def resolve_init_config(request: dict[str, Any]) -> dict[str, Any]:
+def resolve_init_config(request: dict[str, Any], *, source_only: bool = False) -> dict[str, Any]:
     init = dict(request.get("init") or {})
     config = prefix_config.load_prefix_config(prefix_config.get_config_path())
     saved = config.get(request["projectKey"])
     if not isinstance(saved, dict):
         saved = {}
     opencode_model = ""
-    if request["ide"] == "opencode":
+    if not source_only and request["ide"] == "opencode":
         try:
             opencode_model = normalize_opencode_model(saved.get("opencode_model", ""))
         except ApiError as exc:
@@ -1385,7 +1488,7 @@ def resolve_init_config(request: dict[str, Any]) -> dict[str, Any]:
     missing = []
     if not prefix_config.split_repository_list(repo_path):
         missing.append("repoPath")
-    if not reviews_root:
+    if not source_only and not reviews_root:
         missing.append("reviewsRoot")
     if missing:
         raise PreflightError("config_missing", "Prefix config is missing required fields.", details={"missing": missing})
@@ -1397,23 +1500,6 @@ def resolve_init_config(request: dict[str, Any]) -> dict[str, Any]:
         "mcpMode": "required" if saved.get("mcp_enabled", True) else "off",
         "opencodeModel": opencode_model,
     }
-
-
-def resolve_executable(command: str, env_var: str) -> str | None:
-    override = os.environ.get(env_var)
-    candidates = [override] if override else []
-    candidates.append(command)
-    for candidate in candidates:
-        if not candidate:
-            continue
-        path = Path(candidate).expanduser()
-        if path.is_absolute() or path.parent != Path("."):
-            if path.exists():
-                return str(path)
-        resolved = shutil.which(candidate)
-        if resolved:
-            return resolved
-    return None
 
 
 def build_init_argv(
@@ -1447,12 +1533,21 @@ def build_init_argv(
             argv.extend([flag, value])
     if init.get("mrFromTasks"):
         argv.append("--mr-from-tasks")
+    source = request.get("source")
+    if isinstance(source, dict) and source.get("mode") == "mr":
+        identity = {key: source[key] for key in ("mode", "mrId", "gitlabInstanceId", "gitlabProjectPath")
+                    if key in source}
+        argv.extend(["--source-identity", json.dumps(identity, ensure_ascii=False, separators=(",", ":"))])
+    for boundary in init.get("afterCommits", []):
+        argv.extend(["--after-commit", boundary["repoPath"], boundary["sha"]])
     if request.get("force"):
         argv.append("--force")
     if request.get("userInstruction") is not None:
         argv.extend(["--user-instruction", str(request["userInstruction"])])
     if result_path is not None:
-        argv.extend(["--result-path", str(result_path), "--result-schema-version", "2"])
+        argv.extend(["--result-path", str(result_path), "--result-schema-version", "3"])
+    if os.name == "nt" and len(subprocess.list2cmdline(argv).encode("utf-16-le")) // 2 >= 32767:
+        raise PreflightError("init_argv_too_long", "Init arguments exceed the Windows command-line limit.")
     return argv
 
 
@@ -1510,34 +1605,11 @@ def build_cursor_argv(
     ]
 
 
-def build_opencode_argv(
-    task_dir: Path,
-    run_dir: Path,
-    *,
-    executable: str = "opencode",
-    permission_approval_flag: str,
-    model: str = "",
-) -> list[str]:
-    del run_dir
-    argv = [
-        executable,
-        "run",
-        "--dir",
-        str(task_dir),
-        "--command",
-        OPENCODE_REVIEW_COMMAND,
-        permission_approval_flag,
-    ]
-    if model:
-        argv.extend(["--model", model])
-    return argv
-
-
 def select_opencode_permission_approval_flag(help_text: str) -> str | None:
     return next((flag for flag in OPENCODE_PERMISSION_APPROVAL_FLAGS if flag in help_text), None)
 
 
-def build_manual_runner_command(ide: str, task_dir: Path, *, opencode_model: str = "") -> str:
+def build_manual_runner_command(ide: str, task_dir: Path, *, opencode_model: str = "", cli_version: str = "v2") -> str:
     if ide == "cursor":
         model = os.environ.get("REVIEW_TASKS_CURSOR_MODEL", "").strip() or CURSOR_DEFAULT_MODEL
         return (
@@ -1545,6 +1617,12 @@ def build_manual_runner_command(ide: str, task_dir: Path, *, opencode_model: str
             f'--model {model} --output-format text "{CURSOR_REVIEW_PROMPT}"'
         )
     if ide == "opencode":
+        if cli_version == "v2":
+            argv = opencode.headless_argv("opencode", task_dir, opencode_model, cli_version=cli_version)
+            if os.name == "nt":
+                quote = lambda value: "'" + value.replace("'", "''") + "'"
+                return f"Set-Location -LiteralPath {quote(str(task_dir))}; if ($?) {{ & " + " ".join(quote(arg) for arg in argv) + " }"
+            return f"cd -- {shlex.quote(str(task_dir))} && {shlex.join(argv)}"
         if opencode_model:
             argv = ["opencode", "run", "--dir", str(task_dir), "--command", OPENCODE_REVIEW_COMMAND,
                     "--model", opencode_model]
@@ -1579,7 +1657,7 @@ def detect_task_dir(stdout_path: Path, issue_key: str, resolved_init: dict[str, 
     return (Path(str(resolved_init["reviewsRoot"])) / str(resolved_init.get("reviewDirName") or sanitize_task(issue_key))).resolve()
 
 
-def verify_init_artifacts(task_dir: Path, *, ide: str, mcp_mode: str = "required") -> str | None:
+def verify_init_artifacts(task_dir: Path, *, ide: str, mcp_mode: str = "required", opencode_cli_version: str = "v2") -> str | None:
     if not (task_dir / "AGENTS.md").is_file():
         return "Task AGENTS.md is missing."
     review_info = task_dir / "_review_info"
@@ -1608,9 +1686,10 @@ def verify_init_artifacts(task_dir: Path, *, ide: str, mcp_mode: str = "required
     if ide == "opencode":
         if mcp_mode != "off" and not (task_dir / "opencode.json").is_file():
             return "Task opencode.json is missing."
-        command_path = task_dir / ".opencode" / "commands" / f"{OPENCODE_REVIEW_COMMAND}.md"
+        command_path = (task_dir / ".agents" / "skills" / OPENCODE_REVIEW_COMMAND / "SKILL.md"
+                        if opencode_cli_version == "v2" else task_dir / ".opencode" / "commands" / f"{OPENCODE_REVIEW_COMMAND}.md")
         if not command_path.is_file():
-            return f"Task .opencode/commands/{OPENCODE_REVIEW_COMMAND}.md is missing."
+            return f"Task {command_path.relative_to(task_dir).as_posix()} is missing."
     return None
 
 
@@ -1633,11 +1712,7 @@ def build_summary(
 ) -> dict[str, Any]:
     documents = read_review_yaml_documents(yaml_paths)
     severity_counts = {"critical": 0, "important": 0, "desirable": 0}
-    summary_blocks: list[str] = []
     for doc in documents:
-        summary_text = doc.parsed.summary.strip()
-        if summary_text:
-            summary_blocks.append(summary_text)
         for finding in doc.parsed.findings:
             if finding.self_check.decision != "keep" or finding.severity is None:
                 continue
@@ -1655,7 +1730,6 @@ def build_summary(
         "jobId": job_id,
         "issueKey": issue_key,
         "status": "done",
-        "summaryText": "\n\n".join(summary_blocks) if summary_blocks else None,
         "criticalCount": severity_counts["critical"],
         "majorCount": severity_counts["important"],
         "minorCount": severity_counts["desirable"],
@@ -1688,8 +1762,10 @@ def extract_cursor_token_usage(stderr_path: Path, stdout_path: Path) -> int | No
 
 
 def extract_opencode_token_usage(stdout_path: Path, stderr_path: Path) -> int | None:
-    # v1 accepts only JSON/JSONL machine-readable usage events from OpenCode logs.
     matches: list[int] = []
+    root_session: str | None = None
+    has_steps = False
+    steps: dict[tuple[str, str], tuple[int, dict[str, int]] | None] = {}
     for path in (stdout_path, stderr_path):
         if not path.exists():
             continue
@@ -1701,10 +1777,57 @@ def extract_opencode_token_usage(stdout_path: Path, stderr_path: Path) -> int | 
                 payload = json.loads(stripped)
             except json.JSONDecodeError:
                 continue
+            if not isinstance(payload, dict):
+                continue
+            session = payload.get("sessionID")
+            if root_session is None and isinstance(session, str) and session:
+                root_session = session
+            if payload.get("type") == "step_finish":
+                has_steps = True
+                part = payload.get("part")
+                if not isinstance(part, dict) or not root_session or session != root_session:
+                    continue
+                message = part.get("messageID")
+                if not isinstance(message, str) or not message:
+                    continue
+                key = (root_session, message)
+                parsed = _opencode_step_tokens(part.get("tokens")) if part.get("sessionID") == root_session else None
+                if key in steps:
+                    previous = steps[key]
+                    if previous is None or parsed is None or previous[0] != parsed[0] or any(
+                        name in previous[1] and previous[1][name] != count for name, count in parsed[1].items()
+                    ):
+                        parsed = None
+                    else:
+                        parsed = (parsed[0], {**previous[1], **parsed[1]})
+                steps[key] = parsed
+                continue
             value = _token_usage_from_json_payload(payload)
             if value is not None:
                 matches.append(value)
+    if has_steps:
+        valid = [step[0] for step in steps.values() if step is not None]
+        return sum(valid) if valid else None
     return matches[-1] if matches else None
+
+
+def _opencode_step_tokens(tokens: object) -> tuple[int, dict[str, int]] | None:
+    if not isinstance(tokens, dict):
+        return None
+    counters = {name: tokens[name] for name in ("input", "output", "reasoning", "total") if name in tokens}
+    if "cache" in tokens:
+        cache = tokens["cache"]
+        if not isinstance(cache, dict):
+            return None
+        counters.update({f"cache.{name}": cache[name] for name in ("read", "write") if name in cache})
+    if any(not isinstance(value, int) or isinstance(value, bool) or value < 0 for value in counters.values()):
+        return None
+    if "total" in counters:
+        return counters["total"], counters
+    required = ("input", "output", "reasoning", "cache.read", "cache.write")
+    if not all(name in counters for name in required):
+        return None
+    return sum(counters[name] for name in required), counters
 
 
 def _token_usage_from_json_payload(payload: object) -> int | None:
@@ -1739,13 +1862,6 @@ def _token_usage_value(value: object) -> int | None:
     ):
         return input_tokens + output_tokens
     return None
-
-
-def opencode_auth_list_has_credentials(returncode: int, text: str) -> bool:
-    if returncode != 0:
-        return False
-    matches = re.findall(r"(?i)(\d+)\s+credentials", text)
-    return bool(matches and int(matches[-1]) > 0)
 
 
 def has_opencode_provider_auth_env() -> bool:
@@ -1819,6 +1935,15 @@ def terminate_process_tree(process: ProcessLike) -> None:
     pid = getattr(process, "pid", None)
     if pid and sys.platform.startswith("win"):
         subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return
+    group = getattr(process, "_review_tasks_process_group", None)
+    if group is not None:
+        try:
+            os.killpg(group, signal.SIGTERM)
+            time.sleep(0.2)
+            os.killpg(group, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
         return
     try:
         process.terminate()

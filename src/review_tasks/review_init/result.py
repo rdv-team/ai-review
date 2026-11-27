@@ -8,9 +8,10 @@ import tempfile
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from review_tasks.review_init.comparison import ComparisonSummary
+from review_tasks.review_init.commit_source import normalize_after_commits, normalize_repository_path, validate_commit_sha
 
 
 INIT_RESULT_SCHEMA_VERSION = 1
@@ -56,14 +57,90 @@ class InitResultEnvelopeV2(InitResultEnvelope):
     comparisons: list[ComparisonSummary]
 
 
-def parse_init_result(payload: dict) -> InitResultEnvelope | InitResultEnvelopeV2:
+class CommitScopeRepository(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True, strict=True)
+    repo_path: str = Field(alias="repoPath", min_length=1)
+    target: str
+    commits: list[str]
+
+    @field_validator('repo_path')
+    @classmethod
+    def valid_path(cls, value: str) -> str:
+        if not value.strip() or '\x00' in value:
+            raise ValueError('invalid repository path')
+        return value
+
+    @field_validator('target')
+    @classmethod
+    def valid_target(cls, value: str) -> str:
+        # An empty TASK source has no TARGET and contributes no commits.
+        return validate_commit_sha(value) if value else value
+
+    @field_validator('commits')
+    @classmethod
+    def valid_commits(cls, value: list[str]) -> list[str]:
+        normalized = [validate_commit_sha(sha) for sha in value]
+        if len(set(normalized)) != len(normalized):
+            raise ValueError('duplicate effective commit')
+        return normalized
+
+    @model_validator(mode='after')
+    def target_required(self) -> 'CommitScopeRepository':
+        if self.commits and not self.target:
+            raise ValueError('effective commits require TARGET')
+        return self
+
+
+class CommitSelection(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True, strict=True)
+    schema_version: Literal[1] = Field(alias='schemaVersion')
+    mode: Literal['all', 'after']
+    task: str = Field(min_length=1)
+    source: dict
+    boundaries: list[dict]
+    repositories: list[CommitScopeRepository] = Field(min_length=1)
+
+    @model_validator(mode='after')
+    def valid_selection(self) -> 'CommitSelection':
+        mode = self.source.get('mode')
+        if not isinstance(mode, str) or mode not in {'task', 'mr'}:
+            raise ValueError('invalid commit source identity')
+        if mode == 'mr' and (type(self.source.get('mrId')) is not int or self.source['mrId'] <= 0):
+            raise ValueError('MR identity requires positive mrId')
+        paths = [normalize_repository_path(repo.repo_path) for repo in self.repositories]
+        if len(set(paths)) != len(paths):
+            raise ValueError('duplicate effective repository')
+        if self.mode == 'after':
+            boundaries = normalize_after_commits(self.boundaries)
+            if set(boundaries) - set(paths):
+                raise ValueError('boundary repository is absent from effective scope')
+            self.boundaries = [{'repoPath': path, 'sha': sha} for path, sha in boundaries.items()]
+        elif self.boundaries:
+            raise ValueError('all mode cannot have boundaries')
+        return self
+
+
+class InitResultEnvelopeV3(InitResultEnvelopeV2):
+    schema_version: Literal[3] = Field(default=3, alias="schemaVersion")
+    commit_selection: dict | None = Field(default=None, alias="commitSelection")
+
+    @field_validator('commit_selection')
+    @classmethod
+    def valid_selection(cls, value: dict | None) -> dict | None:
+        if value is None:
+            return None
+        return CommitSelection.model_validate(value).model_dump(mode='json', by_alias=True)
+
+
+def parse_init_result(payload: dict) -> InitResultEnvelope | InitResultEnvelopeV2 | InitResultEnvelopeV3:
     if not isinstance(payload, dict):
         raise ValueError("init result must be a JSON object")
-    model = InitResultEnvelopeV2 if payload.get("schemaVersion") == 2 else InitResultEnvelope
+    version = payload.get('schemaVersion')
+    model = {2: InitResultEnvelopeV2, 3: InitResultEnvelopeV3}.get(version, InitResultEnvelope) if type(version) is int else InitResultEnvelope
     return model.model_validate(payload)
 
 
-def write_init_result(path: Path, result: InitResultEnvelope | InitResultEnvelopeV2) -> None:
+def write_init_result(path: Path, result: InitResultEnvelope | InitResultEnvelopeV2 | InitResultEnvelopeV3) -> None:
     """Atomically write UTF-8 JSON with LF line endings."""
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(

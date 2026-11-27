@@ -22,7 +22,7 @@
         <label class="field" for="instructionText">Текст инструкции</label>
         <textarea
           id="instructionText"
-          rows="14"
+          rows="5"
           wrap="soft"
           autofocus
           aria-describedby="instructionHint characterCount draftValidation"
@@ -51,9 +51,26 @@
           <span id="saveStatus" class="save-status" role="status" aria-live="polite"></span>
         </div>
       </form>
+      <section id="commitSelection" class="commit-selection" aria-labelledby="commitSelectionTitle">
+        <h2 id="commitSelectionTitle">Проверить изменения после коммита ...</h2>
+        <p class="selection-hint">Выбранный коммит исключается из повторного ревью.</p>
+        <details class="selection-help">
+          <summary>Как работает выбор</summary>
+          <p>Выберите последний уже проверенный коммит для каждого репозитория. Граница действует до принятого запуска; инструкция сохраняется отдельно.</p>
+          <p>При открытии показана локальная история Git. «Обновить список» получает актуальные коммиты из remote; перед запуском история обновляется повторно.</p>
+        </details>
+        <div id="commitRepositories"></div>
+        <p id="commitSelectionStatus" role="status" aria-live="polite">Загрузка списка…</p>
+        <div class="actions">
+          <button id="applyCommitSelection" type="button" disabled>Сохранить</button>
+          <button id="refreshCommitCandidates" type="button" class="secondary">Обновить список</button>
+        </div>
+      </section>
     </main>
     <script src="issue.js"></script>
     <script src="user-instruction-store.js"></script>
+    <script src="commit-selection-store.js"></script>
+    <script src="api.js"></script>
     <script src="instruction.js"></script>
   </body>
 </html>

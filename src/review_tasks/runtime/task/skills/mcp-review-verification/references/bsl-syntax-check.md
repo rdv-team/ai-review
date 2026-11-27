@@ -1,6 +1,6 @@
 # Capability: bsl-syntax-check
 
-**Когда использовать:** когда вопрос `verification` зависит от синтаксической корректности изменённого BSL-фрагмента или от фактической диагностики BSL Language Server.
+**Когда использовать:** когда вопрос `verification` зависит от синтаксической корректности изменённого BSL-фрагмента или от фактической диагностики `bsl-analyzer`.
 **Registry server id:** `onec-syntax-checker-mcp-remote`
 
 ## Правила проверки

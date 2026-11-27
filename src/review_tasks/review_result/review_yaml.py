@@ -51,10 +51,6 @@ SEVERITY_TITLES = {
 
 DEFAULT_REPORT_TEMPLATE = """# RDV AIR — Отчёт ревью — {{TASK}}
 
-## Сводка
-
-{{SUMMARY}}
-
 ## 🔴 Критично
 
 {{CRITICAL_ISSUES}}
@@ -92,6 +88,9 @@ __all__ = [
     "read_stage_pair_for_render",
     "combined_mapping",
     "write_combined_result",
+    "finding_numbers",
+    "project_author_questions",
+    "report_digest_mapping",
 ]
 
 
@@ -105,6 +104,27 @@ class ReviewYamlDocument:
 
     source: Path
     parsed: ReviewStage2Result | ReviewResponse
+
+
+class _LegacyStage2Result(ReviewStage2Result):
+    """Read-only completed public projection; never used by Stage 2 writers."""
+
+    questions_to_author: list[str]
+
+
+class _LegacyReviewResponse(ReviewResponse):
+    """Read-only completed combined result with the historical question list."""
+
+    questions_to_author: list[str]
+
+
+def report_digest_mapping(document: ReviewYamlDocument) -> dict[str, object]:
+    """Preserve the normalized pre-question-field form of completed legacy reports."""
+    result = document.parsed.model_dump(mode="json")
+    if isinstance(document.parsed, (_LegacyStage2Result, _LegacyReviewResponse)):
+        for finding in result["findings"]:
+            finding.pop("question_to_author", None)
+    return result
 
 
 @dataclass(frozen=True)
@@ -149,6 +169,11 @@ def _load_stage2_text(text: str, *, source: str) -> ReviewStage2Result:
         raise ReviewYamlError(f"{source}: YAML не разбирается: {exc}") from exc
     if not isinstance(loaded, dict):
         raise ReviewYamlError(f"{source}: YAML должен быть объектом верхнего уровня.")
+    if "questions_to_author" in loaded:
+        raise ReviewYamlError(
+            f"{source}: поле `questions_to_author` больше не поддерживается; "
+            "запишите вопрос в `findings[*].question_to_author`."
+        )
     try:
         return ReviewStage2Result.model_validate(normalize_review_result_mapping(loaded, source=source))
     except ValidationError as exc:
@@ -267,10 +292,10 @@ def validate_review_yaml_file(path: Path) -> ReviewYamlValidationResult:
         normalized = normalize_review_result_mapping(raw, source=str(path))
         # Existing local-service fixtures and already completed task catalogs may
         # contain the historical public-only projection. New renderer output is
-        # always identified by risk_candidates and validated by the strict
-        # five-section compatibility model.
+        # identified by risk_candidates and validated by the strict current model.
         if "risk_candidates" in normalized:
-            parsed = ReviewResponse.model_validate(normalized)
+            model = _LegacyReviewResponse if "questions_to_author" in normalized else ReviewResponse
+            parsed = model.model_validate(normalized)
         else:
             # Historical service-only public projections used the previous
             # numeric finding identifier format.
@@ -281,7 +306,8 @@ def validate_review_yaml_file(path: Path) -> ReviewYamlValidationResult:
                     match = re.fullmatch(r"risk-([1-9][0-9]*)", finding["name"])
                     if match:
                         finding["name"] = f"candidate-{match.group(1)}"
-            parsed = ReviewStage2Result.model_validate(normalized)
+            model = _LegacyStage2Result if "questions_to_author" in normalized else ReviewStage2Result
+            parsed = model.model_validate(normalized)
     except yaml.YAMLError as exc:
         raise ReviewYamlError(f"{path}: YAML не разбирается: {exc}") from exc
     except ValidationError as exc:
@@ -381,8 +407,6 @@ def combined_mapping(stage1: ReviewStage1Result, stage2: ReviewStage2Result) -> 
     return {
         "risk_candidates": stage1.risk_candidates.model_dump(mode="python"),
         "findings": findings,
-        "summary": stage2.summary,
-        "questions_to_author": stage2.questions_to_author,
         "missing_context": stage2.missing_context,
     }
 
@@ -407,17 +431,13 @@ def render_review_report(
     template_text: str | None = None,
 ) -> str:
     source_links = _load_source_links_for_documents(documents)
-    summary = _render_summary(documents)
     issue_sections: dict[str, str] = {}
-    next_number = 1
-    for severity in ("critical", "important", "desirable"):
-        issue_sections[severity], next_number = _render_issues(
-            documents, severity, source_links, next_number
+    numbers = finding_numbers(documents)
+    for severity in SEVERITY_TITLES:
+        issue_sections[severity] = _render_issues(
+            documents, severity, source_links, numbers
         )
-    questions = _render_string_list(
-        [item for doc in documents for item in doc.parsed.questions_to_author],
-        empty="_Нет вопросов._",
-    )
+    questions = _render_questions(project_author_questions(documents, source_links))
     missing = _render_string_list(
         [item for doc in documents for item in doc.parsed.missing_context],
         empty="_Не зафиксирован._",
@@ -426,7 +446,6 @@ def render_review_report(
         template_text = DEFAULT_REPORT_TEMPLATE
     values = {
         "TASK": task,
-        "SUMMARY": summary,
         "CRITICAL_ISSUES": issue_sections["critical"],
         "IMPORTANT_ISSUES": issue_sections["important"],
         "DESIRABLE_ISSUES": issue_sections["desirable"],
@@ -439,13 +458,6 @@ def render_review_report(
     return rendered.rstrip() + "\n"
 
 
-def _source_label(path: Path) -> str:
-    match = re.search(r"review_result_(\d{3})\.yaml$", path.name)
-    if match:
-        return f"prompt {match.group(1)}"
-    return path.name
-
-
 def _render_suggestion_markdown(suggestion: str) -> list[str]:
     """Emit GFM-safe Предложение block: label line, blank line, then suggestion body."""
     body = suggestion.strip()
@@ -453,15 +465,6 @@ def _render_suggestion_markdown(suggestion: str) -> list[str]:
     if body:
         lines.append(body)
     return lines
-
-
-def _render_summary(documents: list[ReviewYamlDocument]) -> str:
-    blocks: list[str] = []
-    for doc in documents:
-        summary = doc.parsed.summary.strip()
-        if summary:
-            blocks.append(f"### {_source_label(doc.source)}\n\n{summary}")
-    return "\n\n".join(blocks) if blocks else "_Нет замечаний по сводке._"
 
 
 SourceLink = tuple[str, str, str]
@@ -559,23 +562,115 @@ def published_findings(
                 yield document, finding
 
 
+def finding_numbers(documents: list[ReviewYamlDocument]) -> dict[tuple[Path, str], int]:
+    """Number published findings canonically and dropped findings independently."""
+    numbers: dict[tuple[Path, str], int] = {}
+    for severity in SEVERITY_TITLES:
+        for document, finding in published_findings(documents, severity):
+            numbers[(document.source, finding.name)] = len(numbers) + 1
+    rejected_number = 0
+    for document in documents:
+        for finding in document.parsed.findings:
+            if finding.self_check.decision == "drop":
+                rejected_number += 1
+                numbers[(document.source, finding.name)] = rejected_number
+    return numbers
+
+
+def project_author_questions(
+    documents: list[ReviewYamlDocument],
+    source_links: dict[Path, dict[str, SourceLink]],
+) -> list[str | dict[str, object]]:
+    """Project saved research in document/finding order, without severity filtering."""
+    questions: list[str | dict[str, object]] = []
+    numbers = finding_numbers(documents)
+    for document in documents:
+        if isinstance(document.parsed, (_LegacyStage2Result, _LegacyReviewResponse)):
+            questions.extend(document.parsed.questions_to_author)
+            continue
+        for finding in document.parsed.findings:
+            if finding.question_to_author is None:
+                continue
+            record: dict[str, object] = {
+                "text": finding.question_to_author,
+                "findingLabel": (
+                    f"{'Замечание' if finding.self_check.decision == 'keep' else 'Отклонено агентом'} "
+                    f"№{numbers[(document.source, finding.name)]}"
+                ),
+                "observation": finding.observation,
+            }
+            if (finding.self_check.alternative_interpretation
+                    and finding.self_check.alternative_interpretation.strip()):
+                record["alternativeInterpretation"] = finding.self_check.alternative_interpretation
+            channels = []
+            if finding.verification:
+                for channel in finding.verification.channels or []:
+                    values = {key: value for key, value in (
+                        ("hypothesis", channel.hypothesis), ("resultNote", channel.result_note),
+                    ) if value and value.strip()}
+                    if values:
+                        channels.append(values)
+            if channels:
+                record["verificationChannels"] = channels
+            if finding.self_check.decision == "drop":
+                record["dropReason"] = finding.self_check.drop_reason
+            else:
+                record["suggestion"] = finding.suggestion
+            url = finding_source_url(document, finding, source_links)
+            if url:
+                record["sourceUrl"] = url
+            questions.append(record)
+    return questions
+
+
+def _render_questions(questions: list[str | dict[str, object]]) -> str:
+    blocks: list[str] = []
+    for question in questions:
+        if isinstance(question, str):
+            blocks.append(f"- {question}")
+            continue
+        body = [str(question["text"])]
+        if question.get("sourceUrl"):
+            body.append(f"[Открыть код в GitLab]({question['sourceUrl']})")
+        if question.get("findingLabel"):
+            body.append(str(question["findingLabel"]))
+        for key, heading in (
+            ("observation", "Суть наблюдения"),
+            ("alternativeInterpretation", "Альтернативное объяснение"),
+        ):
+            if question.get(key):
+                body.append(f"**{heading}**\n\n{question[key]}")
+        if question.get("verificationChannels"):
+            body.append("**Результаты проверки**")
+            for channel in question["verificationChannels"]:
+                parts = [f"**{label}**\n\n{channel[key]}" for key, label in (
+                    ("hypothesis", "Проверяли"), ("resultNote", "Результат"),
+                ) if channel.get(key)]
+                body.append("\n\n".join(parts))
+        if question.get("suggestion"):
+            body.append(f"**Предложение**\n\n{question['suggestion']}")
+        if question.get("dropReason"):
+            body.append(f"**Причина отклонения**\n\n{question['dropReason']}")
+        blocks.append("\n\n".join(body))
+    return "\n\n---\n\n".join(blocks) if blocks else "_Нет вопросов._"
+
+
 def _render_issues(
     documents: list[ReviewYamlDocument],
     severity: str,
     source_links: dict[Path, dict[str, SourceLink]],
-    next_number: int,
-) -> tuple[str, int]:
+    numbers: dict[tuple[Path, str], int],
+) -> str:
     blocks: list[str] = []
     for doc, finding in published_findings(documents, severity):
-        header = _finding_heading(doc, finding, source_links, next_number)
+        header = _finding_heading(doc, finding, source_links, numbers[(doc.source, finding.name)])
         body = [header]
         body.append(f"- **Риск**: {SEVERITY_TITLES[severity].lower()}")
         body.append(f"- **Суть**: {finding.observation}")
         if finding.suggestion:
             body.extend(_render_suggestion_markdown(finding.suggestion))
         blocks.append("\n".join(body))
-        next_number += 1
-    return ("\n\n".join(blocks) if blocks else "_Нет замечаний._"), next_number
+    return "\n\n".join(blocks) if blocks else "_Нет замечаний._"
 
 
 def _render_string_list(items: list[str], *, empty: str) -> str:

@@ -43,6 +43,7 @@ ALLOWED_INIT_FIELDS = {
     "mrTitle",
     "mrFromTasks",
     "configPath",
+    "afterCommits",
 }
 ALLOWED_RUNNER_FIELDS = {"mode", "codexPrompt"}
 ALLOWED_JIRA_FIELDS = {"url", "title", "description", "comments"}
@@ -105,6 +106,7 @@ DETAIL_TEXT = {
     "previous_cancelled": "Предыдущий запуск отменен",
     "queued": "В очереди",
     "preflight_running": "Проверяем окружение",
+    "preflight_failed": "Не удалось проверить окружение",
     "init_running": "Готовим каталог ревью",
     "init_done": "Каталог ревью подготовлен",
     "review_starting": "Запускаем агента",
@@ -115,6 +117,7 @@ DETAIL_TEXT = {
     "done_with_warnings": "Ревью выполнено с предупреждениями",
     "already_done": "Ревью уже было выполнено",
     "no_commits": "Нет новых коммитов для ревью",
+    "no_new_commits": "После выбранных границ нет новых коммитов",
     "no_reviewable_files": "Нет подходящих файлов для ревью",
     "summary_unavailable": "Отчет есть, сводка недоступна",
     "init_failed": "Инициализация не выполнена",
@@ -135,6 +138,7 @@ DETAIL_ACTIONS = {
     "previous_cancelled": ["submit", "refresh"],
     "queued": ["cancel"],
     "preflight_running": ["cancel"],
+    "preflight_failed": ["retry", "refresh"],
     "init_running": ["cancel"],
     "init_done": ["cancel"],
     "review_starting": ["cancel"],
@@ -145,6 +149,7 @@ DETAIL_ACTIONS = {
     "done_with_warnings": ["open_report", "open_reasoning", "refresh"],
     "already_done": ["open_report", "open_reasoning", "retry", "refresh"],
     "no_commits": ["retry", "refresh"],
+    "no_new_commits": ["retry", "refresh"],
     "no_reviewable_files": ["retry", "refresh"],
     "summary_unavailable": ["open_report", "open_reasoning", "refresh"],
     "init_failed": ["retry", "refresh"],
@@ -175,7 +180,7 @@ def package_version() -> str:
     try:
         return version("review-tasks")
     except PackageNotFoundError:
-        return "1.1.1"
+        return "2.0.0"
 
 
 def now_iso() -> str:
@@ -367,7 +372,39 @@ def normalize_init_fields(value: Any) -> dict[str, Any]:
             result["mrTitle"] = mr_title
     if "mrFromTasks" in payload:
         result["mrFromTasks"] = normalize_bool(payload["mrFromTasks"], field="init.mrFromTasks")
+    if "afterCommits" in payload:
+        from review_tasks.review_init.commit_source import normalize_after_commits
+
+        entries = payload["afterCommits"]
+        if not isinstance(entries, list) or not entries:
+            raise ApiError("invalid_request", "init.afterCommits must be a non-empty list.")
+        pairs = []
+        for entry in entries:
+            if not isinstance(entry, dict) or set(entry) != {"repoPath", "sha"}:
+                raise ApiError("invalid_request", "Each afterCommits entry must contain repoPath and sha.")
+            pairs.append((entry["repoPath"], entry["sha"]))
+        try:
+            boundaries = normalize_after_commits(pairs, Path.cwd())
+        except (ValueError, TypeError) as exc:
+            raise ApiError("invalid_request", str(exc)) from exc
+        result["afterCommits"] = [{"repoPath": path, "sha": sha} for path, sha in boundaries.items()]
+        if result.get("mrFromTasks"):
+            raise ApiError("invalid_request", "init.afterCommits does not support init.mrFromTasks.")
     return result
+
+
+def normalize_commit_candidates_request(value: Any) -> dict[str, Any]:
+    payload = require_object(value)
+    reject_forbidden_fields(payload, {"issueKey", "init", "refresh"}, path="$")
+    refresh = payload.get("refresh", True)
+    if not isinstance(refresh, bool):
+        raise ApiError("invalid_request", "refresh must be boolean.")
+    init = payload.get("init")
+    if init is not None:
+        reject_forbidden_fields(require_object(init), ALLOWED_INIT_FIELDS - {"afterCommits", "mrFromTasks", "reviewsRoot"}, path="init")
+    issue_key = normalize_issue_key(payload.get("issueKey"))
+    return {"issueKey": issue_key, "projectKey": normalize_project_key(None, issue_key),
+            "init": normalize_init_fields(init), "refresh": refresh}
 
 
 def normalize_runner_fields(value: Any, *, ide: str) -> dict[str, Any]:
@@ -580,6 +617,8 @@ def status_to_popup(status: dict[str, Any] | None, *, issue_key: str | None = No
             "warnings": [],
             "manualCommand": None,
             "source": None,
+            "afterCommits": [],
+            "commitSelection": None,
             "latestAttempt": None,
             "error": None,
             "feedback": None,
@@ -591,11 +630,15 @@ def status_to_popup(status: dict[str, Any] | None, *, issue_key: str | None = No
     from .problem_details import canonical_status_contract
 
     feedback, diagnostics = canonical_status_contract(status)
+    available_actions = status.get("availableActions") or actions_for(detail_status)
+    if detail_status == "preflight_failed":
+        # Restore retry for failures persisted before this action was advertised.
+        available_actions = list(dict.fromkeys([*actions_for(detail_status), *available_actions]))
     return {
         "displayStatus": display_status_for(detail_status),
         "detailStatus": detail_status,
         "detailText": detail_text,
-        "availableActions": status.get("availableActions") or actions_for(detail_status),
+        "availableActions": available_actions,
         "issueKey": status.get("issueKey") or issue_key,
         "jobId": status.get("jobId"),
         "startedAt": status.get("startedAt"),
@@ -610,6 +653,8 @@ def status_to_popup(status: dict[str, Any] | None, *, issue_key: str | None = No
         "warnings": status.get("warnings") if isinstance(status.get("warnings"), list) else [],
         "manualCommand": status.get("manualCommand"),
         "source": status.get("source"),
+        "afterCommits": status.get("afterCommits", []),
+        "commitSelection": status.get("commitSelection"),
         "latestAttempt": status.get("latestAttempt") if isinstance(status.get("latestAttempt"), dict) else None,
         "error": status.get("error"),
         "feedback": feedback,

@@ -13,7 +13,9 @@
     check: 'm5 12 4 4L19 6', cross: 'm6 6 12 12M18 6 6 18',
     comment: 'M21 15a3 3 0 0 1-3 3H8l-5 3V6a3 3 0 0 1 3-3h12a3 3 0 0 1 3 3Z',
     observation: 'M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8l-6-6Zm0 0v6h6M8 13h8M8 17h6',
-    proposal: 'm9 12 2 2 4-4M5 4h14v16H5z'
+    proposal: 'm9 12 2 2 4-4M5 4h14v16H5z',
+    pencil: 'm16 3 5 5M3 21l5-1L21 7l-5-5L3 16v5Z',
+    save: 'M19 21H5a2 2 0 0 1-2-2V3h14l4 4v12a2 2 0 0 1-2 2ZM7 3v6h10V3M7 21v-8h10v8'
   };
   const icon = (name) => `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="${ICON_PATHS[name]}"/></svg>`;
   function decisionBadge(decision) {
@@ -75,6 +77,23 @@
     return url ? `<a class="detail-source" href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">${content}</a>` : `<div class="detail-source unavailable">${content}</div>`;
   }
 
+  function authorQuestionsHtml(questions) {
+    if (!questions || !questions.length) return '<p class="muted">Нет данных.</p>';
+    const section = (heading, content, level = 4) => content && String(content).trim() ? `<section><h${level}>${heading}</h${level}>${renderMarkdown(content)}</section>` : "";
+    return `<span id="question-new-tab" class="visually-hidden">Откроется в новой вкладке</span><div class="author-questions">${questions.map((question, index) => {
+      if (typeof question === "string") return `<div class="author-question"><div class="question-text">${renderMarkdown(question)}</div></div>`;
+      const id = `author-question-${index}`;
+      const channels = (question.verificationChannels || []).map((channel) => {
+        const fields = `${section("Проверяли", channel.hypothesis, 5)}${section("Результат", channel.resultNote, 5)}`;
+        return fields ? `<div class="question-channel">${fields}</div>` : "";
+      }).join("");
+      const reference = question.findingLabel ? `<div class="question-reference">${escapeHtml(question.findingLabel)}</div>` : "";
+      const research = `${reference}${section("Суть наблюдения", question.observation)}${section("Альтернативное объяснение", question.alternativeInterpretation)}${channels ? `<section><h4>Результаты проверки</h4>${channels}</section>` : ""}${section("Предложение", question.suggestion)}${section("Причина отклонения", question.dropReason)}`;
+      const url = safeUrl(question.sourceUrl);
+      return `<div class="author-question"><div id="${id}-text" class="question-text">${renderMarkdown(question.text)}</div><div class="question-actions"><details class="question-details"><summary aria-labelledby="${id}-toggle ${id}-text"><span id="${id}-toggle">Подробности проверки</span></summary><div class="question-research">${research}</div></details>${url ? `<a class="question-source" href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer" aria-labelledby="${id}-source ${id}-text" aria-describedby="question-new-tab"><span id="${id}-source">Открыть код в GitLab</span></a>` : ""}</div></div>`;
+    }).join("")}</div>`;
+  }
+
   function markdownText(markdown, markedImpl) {
     const parser = markedImpl || (typeof marked !== "undefined" ? marked : null);
     if (!parser || !parser.lexer) return stripFrontMatter(markdown);
@@ -126,7 +145,7 @@
     })]);
   }
 
-  class FeedbackQueue {
+  class ReportStateQueue {
     constructor({ api, jobId, reportId, findings = {}, onChange = () => {} }) {
       Object.assign(this, { api, jobId, reportId, onChange });
       this.entries = new Map();
@@ -198,13 +217,13 @@
         entry.failedSubmission = Boolean(submission);
         this.onChange(id);
         let body;
-        try { body = await this.api.saveFeedback(this.jobId, payload); }
+        try { body = await this.api.saveReportState(this.jobId, payload); }
         catch (error) {
           body = error.body;
           if (!body || !body.stateSaved || !body.finding) {
             entry.error = error;
             const code = body && body.error && body.error.code;
-            entry.status = code === "feedback_conflict" ? "conflict" : ["report_changed", "feedback_unavailable"].includes(code) ? "report-changed" : "error";
+            entry.status = code === "report_state_conflict" ? "conflict" : ["report_changed", "report_state_unavailable"].includes(code) ? "report-changed" : "error";
             this.onChange(id);
             return result;
           }
@@ -218,11 +237,6 @@
         if (submission) result = { generation: submission.generation, memorySaved: body.memorySaved === true };
         entry.failedSubmission = Boolean(submission) && body.memorySaved === false;
         entry.status = entry.error ? "memory-error" : entry.dirty ? "pending" : "saved";
-        if (body.memorySaved === true) {
-          for (const other of this.entries.values()) {
-            if (other !== entry && other.status === "memory-error" && !other.dirty) { other.status = "saved"; other.error = null; }
-          }
-        }
         this.onChange(id);
         // Only later decision/reset changes are flushed. Later comment edits
         // stay local even when an explicit submission just completed.
@@ -236,7 +250,7 @@
       if (entry.status === "report-changed") return;
       if (entry.status === "conflict") {
         try {
-          const current = await this.api.getFeedback(this.jobId);
+          const current = await this.api.getReportState(this.jobId);
           if (current.reportId !== this.reportId) { entry.status = "report-changed"; this.onChange(id); return; }
           entry.confirmed = { ...emptyFinding(), ...current.findings[id] };
         } catch (error) { entry.error = error; this.onChange(id); return; }
@@ -327,17 +341,21 @@
     setWidth(width);
   }
 
-  function attachInteractive(view, feedback, api, jobId) {
+  function attachInteractive(view, reportState, api, jobId, discussion = null, readOnly = false, report = {}) {
     let tab = "published";
+    let suggestionEditor = null;
+    let suggestionRequest = null;
     let listTab = null;
     const commentExpanded = new Map();
     const agentSends = new Map();
     const selected = { published: (view.published[0] || {}).id, agentRejected: (view.agentRejected[0] || {}).id };
-    const queue = new FeedbackQueue({ api, jobId, reportId: view.reportId, findings: feedback.findings, onChange: update });
-    for (const finding of view.published) queue.entry(finding.id);
+    const queue = readOnly ? null : new ReportStateQueue({ api, jobId, reportId: view.reportId, findings: reportState.findings, onChange: update });
+    if (queue) for (const finding of view.published) queue.entry(finding.id);
+    const findingState = (id) => readOnly ? (reportState.findings || {})[id] || emptyFinding() : queue.entry(id).draft;
+    const hasUnsentComment = (id) => !readOnly && queue.hasUnsentComment(id);
     function currentFinding() { return (view[tab] || []).find((item) => item.id === selected[tab]); }
     function update() {
-      const counts = statistics(view, queue.snapshot());
+      const counts = statistics(view, readOnly ? reportState.findings || {} : queue.snapshot());
       $("statistics").innerHTML = [["Всего", counts.total, "total"], ["Критично", counts.critical, "critical"], ["Принято", counts.accepted, "accepted"], ["Отклонено", counts.rejected, "rejected"], ["Без решения", counts.undecided, "undecided"]].map(([label, count, tone]) => `<span class="metric"><span class="metric-dot ${tone}" aria-hidden="true"></span>${label}<strong>${count}</strong></span>`).join("");
       const reviewed = counts.accepted + counts.rejected;
       const complete = counts.total > 0 && reviewed === counts.total;
@@ -345,7 +363,7 @@
       $("previewJira").textContent = `Скопировать принятые · ${counts.accepted}`;
       $("previewJira").disabled = counts.accepted === 0;
       renderList();
-      if (tab !== "published" || !currentFinding()) return;
+      if (readOnly || tab !== "published" || !currentFinding()) return;
       const entry = queue.entry(selected.published);
       $("accept").setAttribute("aria-pressed", String(entry.draft.decision === "accepted"));
       $("reject").setAttribute("aria-pressed", String(entry.draft.decision === "rejected"));
@@ -383,33 +401,83 @@
           const card = document.createElement("button");
           card.dataset.findingId = item.id;
           updateCard(card, item);
-          card.addEventListener("click", () => { flushSelected(); selected[tab] = item.id; showDetails(); update(); });
+          card.addEventListener("click", () => { flushSelected(); if (selected[tab] !== item.id) suggestionEditor = null; selected[tab] = item.id; showDetails(); update(); });
           list.appendChild(card);
         }
       }
     }
     function updateCard(card, item) {
-      const state = tab === "published" ? queue.entry(item.id).draft : null;
+      const state = tab === "published" ? findingState(item.id) : null;
       card.className = `finding-card${selected[tab] === item.id ? " selected" : ""}`;
       card.setAttribute("aria-pressed", String(selected[tab] === item.id));
-      card.innerHTML = `<span class="card-title">${escapeHtml(item.number != null ? `${item.number}. ` : "")}${escapeHtml(findingTitle(item))}</span><span class="card-location">${escapeHtml(locationText(item))}</span>${state ? `<span class="card-status">${decisionBadge(state.decision)}${state.comment.trim() || queue.hasUnsentComment(item.id) ? `<span class="comment-indicator">${icon("comment")}${queue.hasUnsentComment(item.id) ? "Черновик комментария" : "Есть комментарий"}</span>` : ""}</span>` : ""}`;
+      card.innerHTML = `<span class="card-title">${escapeHtml(item.number != null ? `${item.number}. ` : "")}${escapeHtml(findingTitle(item))}</span><span class="card-location">${escapeHtml(locationText(item))}</span>${state ? `<span class="card-status">${decisionBadge(state.decision)}${state.comment.trim() || hasUnsentComment(item.id) ? `<span class="comment-indicator">${icon("comment")}${hasUnsentComment(item.id) ? "Черновик комментария" : "Есть комментарий"}</span>` : ""}</span>` : ""}`;
     }
-    function flushSelected() { if (tab === "published" && selected.published) queue.flush(selected.published); }
+    function flushSelected() { if (!readOnly && tab === "published" && selected.published) queue.flush(selected.published); }
+    function proposalHtml(finding) {
+      const editable = !readOnly && report.canEditSuggestions === true;
+      const editing = suggestionEditor && suggestionEditor.findingId === finding.id;
+      const button = (id, symbol, label) => `<button type="button" id="${id}" class="suggestion-action" title="${label}" aria-label="${label}"${suggestionRequest ? " disabled" : ""}>${icon(symbol)}</button>`;
+      const actions = !editable ? "" : editing
+        ? button("saveSuggestion", "save", "Сохранить предложение") + button("cancelSuggestion", "cross", "Отменить")
+        : button("editSuggestion", "pencil", "Редактировать предложение");
+      return `<section class="finding-section proposal-section"><h3>${icon("proposal")}Предложение<span class="suggestion-actions">${actions}</span></h3>${editing
+        ? `<textarea id="suggestionDraft" class="suggestion-draft" aria-label="Предложение в Markdown"${suggestionRequest ? " disabled" : ""}>${escapeHtml(suggestionEditor.draft)}</textarea><p class="suggestion-error" role="status">${escapeHtml(suggestionEditor.error || "")}</p>`
+        : renderMarkdown(finding.suggestion)}</section>`;
+    }
+    function bindSuggestion(finding) {
+      if (readOnly || report.canEditSuggestions !== true) return;
+      if (!suggestionEditor) {
+        $("editSuggestion").addEventListener("click", () => {
+          if (suggestionRequest) return;
+          suggestionEditor = { findingId: finding.id, draft: finding.suggestion, expectedSuggestion: finding.suggestion };
+          showDetails(); $("suggestionDraft").focus();
+        });
+        return;
+      }
+      $("suggestionDraft").addEventListener("input", () => { suggestionEditor.draft = $("suggestionDraft").value; });
+      $("cancelSuggestion").addEventListener("click", () => { if (!suggestionRequest) { suggestionEditor = null; showDetails(); } });
+      $("saveSuggestion").addEventListener("click", () => {
+        if (suggestionRequest) return suggestionRequest;
+        const editor = suggestionEditor;
+        const payload = { reportId: view.reportId, findingId: editor.findingId, suggestion: editor.draft, expectedSuggestion: editor.expectedSuggestion };
+        suggestionRequest = (async () => {
+          try {
+            const result = await Promise.resolve().then(() => api.saveReportSuggestion(jobId, payload));
+            const target = view.published.find((item) => item.id === payload.findingId);
+            target.suggestion = result.suggestion;
+            report.content = result.content;
+            if (suggestionEditor === editor) suggestionEditor = null;
+          } catch (error) {
+            const message = error.message || "Не удалось сохранить предложение. Повторите попытку.";
+            if (suggestionEditor === editor) editor.error = message;
+            else renderError(message);
+          } finally {
+            suggestionRequest = null;
+            showDetails();
+          }
+        })();
+        showDetails();
+        return suggestionRequest;
+      });
+    }
     function showDetails() {
       $("decisionPanel").hidden = true;
+      if (discussion) discussion.setFinding(tab === "published" ? currentFinding() : null, view.reportId);
       $("workspace").classList.toggle("summary-mode", tab === "summary");
       if (tab === "summary") {
         const section = (title, value) => `<h3>${title}</h3>${Array.isArray(value) ? value.length ? `<ul>${value.map((item) => `<li>${renderMarkdown(item)}</li>`).join("")}</ul>` : '<p class="muted">Нет данных.</p>' : value ? renderMarkdown(value) : '<p class="muted">Нет данных.</p>'}`;
-        $("details").innerHTML = `<div class="text-column"><h2>Итоги исследования</h2>${section("Сводка", view.summary)}${section("Вопросы автору", view.questionsToAuthor)}${section("Недостающий контекст", view.missingContext)}</div>`;
+        $("details").innerHTML = `<div class="text-column"><h2>Итоги исследования</h2><h3>Вопросы автору</h3>${authorQuestionsHtml(view.questionsToAuthor)}${section("Недостающий контекст", view.missingContext)}</div>`;
         return;
       }
       const finding = currentFinding();
       $("details").scrollTop = 0;
       if (!finding) { $("details").innerHTML = '<p class="empty">В этом разделе нет замечаний.</p>'; return; }
-      const badges = tab === "published" ? `<div class="detail-badges"><span class="severity-badge ${escapeHtml(finding.severity)}">${escapeHtml(SEVERITIES[finding.severity])}</span><span id="detailDecision">${decisionBadge(queue.entry(finding.id).draft.decision)}</span><span class="detail-index">Замечание ${escapeHtml(finding.number)}</span></div>` : '<div class="detail-badges"><span class="status-badge">Исключено агентом</span></div>';
+      const badges = tab === "published" ? `<div class="detail-badges"><span class="severity-badge ${escapeHtml(finding.severity)}">${escapeHtml(SEVERITIES[finding.severity])}</span><span id="detailDecision">${decisionBadge(findingState(finding.id).decision)}</span><span class="detail-index">Замечание №${escapeHtml(finding.number)}</span></div>` : `<div class="detail-badges"><span class="status-badge">Исключено агентом</span>${finding.number != null ? `<span class="detail-index">Отклонено агентом №${escapeHtml(finding.number)}</span>` : ""}</div>`;
       const section = (className, heading, content, symbol) => `<section class="finding-section ${className}"><h3>${icon(symbol)}${heading}</h3>${renderMarkdown(content)}</section>`;
-      $("details").innerHTML = `<div class="text-column">${badges}${sourceBlockHtml(finding)}${section("observation-section", "Суть наблюдения", finding.observation, "observation")}${tab === "published" ? finding.suggestion ? section("proposal-section", "Предложение", finding.suggestion, "proposal") : "" : section("drop-section", "Причина отклонения", finding.dropReason, "cross")}</div>`;
-      if (tab === "published") { $("decisionPanel").hidden = false; $("comment").value = queue.entry(finding.id).draft.comment; }
+      const savedComment = readOnly && tab === "published" ? findingState(finding.id).comment : "";
+      $("details").innerHTML = `<div class="text-column">${badges}${sourceBlockHtml(finding)}${section("observation-section", "Суть наблюдения", finding.observation, "observation")}${tab === "published" ? finding.suggestion ? proposalHtml(finding) : "" : section("drop-section", "Причина отклонения", finding.dropReason, "cross")}${savedComment ? `<section class="finding-section"><h3>${icon("comment")}Сохранённый комментарий</h3><p class="saved-comment">${escapeHtml(savedComment)}</p></section>` : ""}</div>`;
+      if (tab === "published" && finding.suggestion) bindSuggestion(finding);
+      if (!readOnly && tab === "published") { $("decisionPanel").hidden = false; $("comment").value = findingState(finding.id).comment; }
     }
     function updateCommentEditor() {
       const id = selected.published;
@@ -437,12 +505,14 @@
     for (const button of $("tabs").querySelectorAll("button")) {
       if (button.dataset.tab === "published") button.textContent = `Замечания · ${view.published.length}`;
       if (button.dataset.tab === "agentRejected") button.textContent = `Отклонено агентом · ${view.agentRejected.length}`;
+      if (button.dataset.tab === "summary") button.textContent = (view.questionsToAuthor || []).length ? `Итоги · вопросов: ${view.questionsToAuthor.length}` : "Итоги";
       button.addEventListener("click", () => {
-        flushSelected(); tab = button.dataset.tab;
+        flushSelected(); if (tab !== button.dataset.tab) suggestionEditor = null; tab = button.dataset.tab;
         for (const other of $("tabs").querySelectorAll("button")) other.setAttribute("aria-pressed", String(other === button));
         showDetails(); update();
       });
     }
+    if (!readOnly) {
     for (const [id, decision] of [["accept", "accepted"], ["reject", "rejected"]]) $(id).addEventListener("click", () => { clearAgentStatus(selected.published); queue.edit(selected.published, { decision }, true); });
     $("reset").addEventListener("click", () => {
       clearAgentStatus(selected.published);
@@ -452,7 +522,6 @@
     $("comment").addEventListener("input", () => { clearAgentStatus(selected.published); queue.edit(selected.published, { comment: $("comment").value }); });
     $("comment").addEventListener("blur", flushSelected);
     $("toggleComment").addEventListener("click", () => setCommentExpanded(commentExpanded.get(selected.published) === false));
-    $("closeComment").addEventListener("click", () => setCommentExpanded(false));
     $("sendAgent").addEventListener("click", async () => {
       const id = selected.published;
       const entry = queue.entry(id);
@@ -472,9 +541,10 @@
     $("retrySave").addEventListener("click", () => queue.retry(selected.published));
     $("reloadReport").addEventListener("click", () => window.location.reload());
     window.addEventListener("beforeunload", (event) => {
-      if ([...queue.entries].some(([id, entry]) => entry.dirty || entry.pending || queue.hasUnsentComment(id))) { event.preventDefault(); event.returnValue = ""; }
+      if (suggestionRequest || (suggestionEditor && suggestionEditor.draft !== suggestionEditor.expectedSuggestion) || [...queue.entries].some(([id, entry]) => entry.dirty || entry.pending || queue.hasUnsentComment(id))) { event.preventDefault(); event.returnValue = ""; }
     });
     async function refreshPreview() {
+      await suggestionRequest;
       await queue.drain();
       const exported = buildJiraExport(view, queue.snapshot(true));
       $("jiraPreview").innerHTML = exported.html;
@@ -497,11 +567,74 @@
         root.RdvUiFeedback.flashButtonFeedback($("copyJira"), { success: false, failLabel: "Не удалось" });
       }
     });
-    for (const id of ["workspace", "statistics", "tabs", "previewJira"]) $(id).hidden = false;
+    }
+    for (const id of ["workspace", "statistics", "tabs"]) $(id).hidden = false;
+    $("previewJira").hidden = readOnly;
     $("truncatedWarning").hidden = view.inputTruncated !== true;
     showDetails(); update();
     attachPanelResizer($("workspace"), $("panelResizer"));
     return queue;
+  }
+
+  function attachDiscussionAction(api, jobId, capability) {
+    const reportButton = $("discussReport");
+    const findingButton = $("discussFinding");
+    const status = $("discussionStatus");
+    const message = $("discussionMessage");
+    const dismiss = $("dismissDiscussionStatus");
+    const available = capability && capability.available === true;
+    const reason = !capability ? "Обновите локальный сервис, чтобы обсуждать отчёт с агентом."
+      : !available ? (capability.reason && capability.reason.message) || "Обсуждение недоступно для этого отчёта." : "";
+    let selectedContext = null;
+    let pending = false;
+    let statusTimer;
+    function updateButtons() {
+      reportButton.disabled = pending;
+      findingButton.disabled = pending || !selectedContext;
+      reportButton.setAttribute("aria-disabled", String(!available || pending));
+      findingButton.setAttribute("aria-disabled", String(!available || pending || !selectedContext));
+      findingButton.hidden = !selectedContext;
+      reportButton.setAttribute("aria-busy", String(pending));
+      findingButton.setAttribute("aria-busy", String(pending));
+    }
+    function showStatus(text, state = "", duration = 0) {
+      clearTimeout(statusTimer);
+      message.textContent = text;
+      status.dataset.state = state;
+      status.hidden = !text;
+      dismiss.hidden = state !== "error";
+      if (duration) statusTimer = setTimeout(() => showStatus(""), duration);
+    }
+    async function open(context) {
+      if (pending || context === null) return;
+      if (!available) { showStatus(reason, "error"); return; }
+      // Capture the selected IDs before awaiting; later selection changes only
+      // affect the next opening, never the request already being sent.
+      const payload = { ...context };
+      pending = true;
+      updateButtons();
+      showStatus("Открытие OpenCode…");
+      try {
+        await api.openDiscussion(jobId, payload);
+        showStatus("Процесс OpenCode запущен. Дождитесь готовности в открывшемся окне.", "", 3000);
+      } catch (error) {
+        showStatus(error.message || "Не удалось открыть обсуждение. Повторите попытку.", "error");
+      } finally {
+        pending = false;
+        updateButtons();
+      }
+    }
+    reportButton.addEventListener("click", () => open({}));
+    findingButton.addEventListener("click", () => open(selectedContext));
+    dismiss.addEventListener("click", () => showStatus(""));
+    showStatus("");
+    updateButtons();
+    return {
+      setFinding(finding, reportId) {
+        selectedContext = finding ? { reportId, findingId: finding.id } : null;
+        updateButtons();
+      }
+    };
   }
 
   async function attachChangesAction(api, jobId) {
@@ -532,33 +665,80 @@
     }));
   }
 
+  async function attachVersions(api, jobId, versionId) {
+    const control = $("versionControl");
+    const list = $("reportVersion");
+    function render(versions, currentAvailable = true) {
+      list.replaceChildren();
+      const add = (value, label, disabled = false) => {
+        const item = document.createElement(disabled ? "span" : "a");
+        item.textContent = label;
+        if (disabled) item.setAttribute("aria-disabled", "true");
+        else {
+          const target = new URL(window.location.href);
+          if (value) target.searchParams.set("version", value);
+          else target.searchParams.delete("version");
+          item.setAttribute("href", target.href);
+        }
+        if (value === versionId) item.setAttribute("aria-current", "page");
+        list.appendChild(item);
+      };
+      add("", currentAvailable ? "Текущая" : "Текущая · недоступна", !currentAvailable);
+      for (const version of versions) add(version.versionId, `Архивировано ${new Date(version.archivedAt).toLocaleString()}`);
+      if (versionId && !versions.some((version) => version.versionId === versionId)) add(versionId, "Выбранная архивная версия · недоступна", true);
+      const selected = versions.find((version) => version.versionId === versionId);
+      $("versionLabel").textContent = !versionId ? "Текущая" : selected ? new Date(selected.archivedAt).toLocaleString(undefined, { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" }) : "Архив";
+      control.title = selected ? `Архивировано ${new Date(selected.archivedAt).toLocaleString()}` : "Версии отчёта";
+      control.hidden = !versionId && versions.length === 0;
+    }
+    render([]);
+    control.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") { control.open = false; control.querySelector("summary").focus(); }
+    });
+    window.addEventListener("click", (event) => {
+      if (control.open && !control.contains(event.target)) control.open = false;
+    });
+    try {
+      const history = await api.getReportVersions(jobId);
+      render(history.versions, history.currentAvailable);
+    } catch {
+      // Older services keep their current-report behavior without history.
+    }
+  }
+
   async function init() {
     const jobId = jobIdFromLocation(window.location);
     if (!jobId) { renderError("jobId не указан."); return; }
     const issueKeyFromUrl = issueKeyFromLocation(window.location);
+    const versionId = new URL(window.location.href).searchParams.get("version") || "";
+    const readOnly = Boolean(versionId);
+    $("readOnlyNotice").hidden = !readOnly;
+    if (readOnly) for (const id of ["discussReport", "discussFinding", "openChanges", "previewJira", "decisionPanel"]) $(id).hidden = true;
     const title = (issueKeyFromApi) => applyReportHeading($("title"), $("reportIssueKey"), pageUtils.resolveArtifactLabel({ issueKeyFromUrl, issueKeyFromApi, jobId }));
     title("");
     try {
       const stored = await chrome.storage.local.get({ servicePort: 8765, serviceToken: "" });
       const api = new root.RdvLocalReviewApi.LocalReviewApi({ port: stored.servicePort, token: stored.serviceToken });
-      void attachChangesAction(api, jobId);
-      const report = await api.getReport(jobId);
+      void attachVersions(api, jobId, versionId);
+      if (!readOnly) void attachChangesAction(api, jobId);
+      const report = await (readOnly ? api.getReportVersion(jobId, versionId) : api.getReport(jobId));
+      const discussion = readOnly ? null : attachDiscussionAction(api, jobId, report.discussion);
       title(report.issueKey);
       $("reportPath").textContent = report.reportPath || "";
       $("copyMarkdown").addEventListener("click", () => handleCopyClick($("copyMarkdown"), report.content || ""));
       if (report.view) {
         try {
-          const feedback = await api.getFeedback(jobId);
-          if (feedback.reportId !== report.view.reportId) throw new Error("Отчёт изменился. Обновите страницу.");
-          attachInteractive(report.view, feedback, api, jobId);
+          const reportState = readOnly ? report.reportState : await api.getReportState(jobId);
+          if (!readOnly && reportState.reportId !== report.view.reportId) throw new Error("Отчёт изменился. Обновите страницу.");
+          attachInteractive(report.view, reportState, api, jobId, discussion, readOnly, report);
           return;
         } catch (error) { renderError(`Интерактивные действия недоступны: ${error.message}`); }
-      } else renderError("Интерактивные действия недоступны для этого отчёта. Показан исходный Markdown.");
+      } else renderError(readOnly ? `Структурированный просмотр недоступен. Показан исходный Markdown.${report.viewError && report.viewError.message ? ` ${report.viewError.message}` : ""}` : "Интерактивные действия недоступны для этого отчёта. Показан исходный Markdown.");
       $("content").hidden = false;
       $("content").innerHTML = renderMarkdown(report.content || "");
     } catch (error) { renderError(error.message || String(error)); }
   }
 
   if (typeof document !== "undefined") document.addEventListener("DOMContentLoaded", init);
-  if (typeof module !== "undefined") module.exports = { jobIdFromLocation, issueKeyFromLocation, stripFrontMatter, renderMarkdown, markdownText, copyToClipboard, handleCopyClick, escapeHtml, safeUrl, findingTitle, sourceBlockHtml, statistics, buildJiraExport, writeJiraClipboard, FeedbackQueue, applyReportHeading, attachPanelResizer, attachInteractive, attachChangesAction, init };
+  if (typeof module !== "undefined") module.exports = { jobIdFromLocation, issueKeyFromLocation, stripFrontMatter, renderMarkdown, markdownText, copyToClipboard, handleCopyClick, escapeHtml, safeUrl, findingTitle, sourceBlockHtml, statistics, buildJiraExport, writeJiraClipboard, ReportStateQueue, applyReportHeading, attachPanelResizer, attachInteractive, attachDiscussionAction, attachChangesAction, init };
 })(typeof globalThis !== "undefined" ? globalThis : window);

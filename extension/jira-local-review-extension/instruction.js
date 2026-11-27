@@ -14,6 +14,220 @@
     refreshRequestId: 0
   };
   const $ = (id) => document.getElementById(id);
+  const selection = { draft: null, repositories: null, boundaries: [], requestId: 0, pending: false, error: "", applied: true };
+
+  function selectionMessage(error) {
+    if (error && error.status === 404) return "Локальный сервис не поддерживает выбор границы. Обновите сервис; ограничение не заменяется полным ревью.";
+    if (error && ["stale_draft", "revision_conflict"].includes(error.code || error.message)) {
+      return "Выбор изменился или запуск уже принят. Откройте «Инструкция агенту» заново из popup.";
+    }
+    return `Не удалось обновить границу. ${error && error.message || "Проверьте сервис и хранилище."}`;
+  }
+
+  function renderSelectionStatus() {
+    const result = selection.repositories
+      ? root.RdvCommitSelection.selectionState(selection.repositories, selection.boundaries) : null;
+    $("applyCommitSelection").disabled = selection.pending || Boolean(selection.error) || !result || !result.canApply;
+    $("refreshCommitCandidates").disabled = selection.pending || !selection.draft;
+    const status = $("commitSelectionStatus");
+    status.className = selection.error || (result && result.missing.length) ? "error" : "";
+    status.textContent = selection.error || (selection.pending ? "Загрузка списка…"
+      : result && result.missing.length ? "Выбранная граница исчезла. Явно выберите другой коммит или «Все коммиты»."
+        : result ? `Новых коммитов: ${result.count}.${result.count ? selection.applied ? " Граница сохранена до принятого запуска." : " Нажмите «Сохранить», чтобы сохранить выбор." : " Новых коммитов нет; сохранение недоступно."}` : "");
+  }
+
+  function renderCommitRepositories() {
+    const container = $("commitRepositories");
+    container.replaceChildren();
+    const repositories = [...selection.repositories];
+    for (const boundary of selection.boundaries) {
+      if (!repositories.some((repo) => repo.repoPath === boundary.repoPath)) {
+        repositories.push({ repoPath: boundary.repoPath, commits: [] });
+      }
+    }
+    repositories.forEach((repo, index) => {
+      const wrapper = document.createElement("div");
+      wrapper.className = "commit-repository";
+      const boundary = selection.boundaries.find((item) => item.repoPath === repo.repoPath);
+      const heading = document.createElement("div");
+      heading.className = "commit-repository-heading";
+      const label = document.createElement("label");
+      label.textContent = repo.repoPath.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || repo.repoPath;
+      label.title = repo.repoPath;
+      const pathDetails = document.createElement("details");
+      pathDetails.className = "commit-repository-path";
+      const pathSummary = document.createElement("summary");
+      pathSummary.textContent = "Путь";
+      const path = document.createElement("code");
+      path.textContent = repo.repoPath;
+      pathDetails.append(pathSummary, path);
+      heading.append(label, pathDetails);
+      wrapper.appendChild(heading);
+      if (!repo.commits.length && !boundary) {
+        wrapper.className += " is-empty";
+        const empty = document.createElement("span");
+        empty.className = "commit-repository-empty";
+        empty.textContent = "Коммитов задачи нет";
+        heading.appendChild(empty);
+        container.appendChild(wrapper);
+        return;
+      }
+      const select = document.createElement("select");
+      select.id = `commitBoundary${index}`;
+      label.htmlFor = select.id;
+      select.setAttribute("aria-label", `Граница ревью: ${label.textContent}`);
+      const detail = document.createElement("div");
+      detail.id = `${select.id}Detail`;
+      detail.className = "commit-detail";
+      select.setAttribute("aria-describedby", detail.id);
+      const all = document.createElement("option");
+      all.value = "";
+      all.textContent = "Все коммиты";
+      select.appendChild(all);
+      for (const commit of repo.commits) {
+        const option = document.createElement("option");
+        option.value = commit.sha.toLowerCase();
+        // Git %cs is a calendar date. Display it without a timezone conversion.
+        option.textContent = `${commit.date} · ${commit.sha.slice(0, 8)} · ${commit.subject}`;
+        option.title = `${commit.sha}\n${commit.subject}\n${commit.date}`;
+        select.appendChild(option);
+      }
+      if (boundary && !repo.commits.some((commit) => commit.sha.toLowerCase() === boundary.sha)) {
+        const missing = document.createElement("option");
+        missing.value = boundary.sha;
+        missing.textContent = `${boundary.sha} · граница недоступна`;
+        select.appendChild(missing);
+      }
+      select.value = boundary ? boundary.sha : "";
+      const updateDetail = () => {
+        const commit = repo.commits.find((item) => item.sha.toLowerCase() === select.value);
+        detail.replaceChildren();
+        detail.hidden = !select.value;
+        if (!select.value) return;
+        detail.className = commit ? "commit-detail" : "commit-detail is-missing";
+        const meta = document.createElement("div");
+        meta.className = "commit-detail-meta";
+        const subject = document.createElement("div");
+        subject.className = "commit-detail-subject";
+        subject.textContent = commit ? commit.subject : "Граница недоступна";
+        const badge = document.createElement("span");
+        badge.className = "commit-count";
+        badge.textContent = commit ? `Новых: ${commit.afterCount}` : "Требуется перевыбор";
+        meta.append(subject, badge);
+        detail.appendChild(meta);
+        if (!commit) {
+          const hint = document.createElement("div");
+          hint.className = "commit-detail-hint";
+          hint.textContent = "Выберите доступный коммит или «Все коммиты».";
+          detail.appendChild(hint);
+        }
+        const more = document.createElement("details");
+        more.className = "commit-more";
+        const summary = document.createElement("summary");
+        summary.textContent = "Подробнее";
+        const sha = document.createElement("code");
+        sha.className = "commit-detail-sha";
+        sha.textContent = commit ? commit.sha : select.value;
+        more.append(summary, sha);
+        if (commit) {
+          const date = document.createElement("div");
+          date.className = "commit-detail-date";
+          date.textContent = `Дата коммита: ${commit.date}`;
+          more.appendChild(date);
+        }
+        detail.appendChild(more);
+      };
+      updateDetail();
+      select.addEventListener("change", () => {
+        selection.applied = false;
+        selection.boundaries = selection.boundaries.filter((item) => item.repoPath !== repo.repoPath);
+        if (select.value) selection.boundaries.push({ repoPath: repo.repoPath, sha: select.value });
+        updateDetail();
+        renderSelectionStatus();
+      });
+      wrapper.append(select, detail);
+      container.appendChild(wrapper);
+    });
+    renderSelectionStatus();
+  }
+
+  async function refreshCommitCandidates(refresh = true) {
+    if (!selection.draft || selection.pending) return;
+    const requestId = ++selection.requestId;
+    const draftId = selection.draft.draftId;
+    selection.pending = true;
+    selection.error = "";
+    renderSelectionStatus();
+    try {
+      await root.RdvCommitSelection.request(chrome.runtime, "read", { draftId });
+      const context = selection.draft.context;
+      if (context.mode === "mr" && !context.init) {
+        selection.error = "Сначала выберите MR в popup. Инструкцию можно редактировать.";
+        return;
+      }
+      const settings = await chrome.storage.local.get({ servicePort: 8765, serviceToken: "" });
+      const api = new root.RdvLocalReviewApi.LocalReviewApi({ port: settings.servicePort, token: settings.serviceToken });
+      const response = await api.getCommitCandidates(state.issueKey, context.init, refresh);
+      await root.RdvCommitSelection.request(chrome.runtime, "read", { draftId });
+      if (requestId !== selection.requestId || draftId !== selection.draft.draftId) return;
+      if (!response || !response.ok || !Array.isArray(response.repositories)) throw new Error("invalid_candidates");
+      selection.repositories = response.repositories;
+      renderCommitRepositories();
+    } catch (error) {
+      if (requestId === selection.requestId) {
+        selection.error = selectionMessage(error);
+        if (!refresh && error.status !== 404 && !["stale_draft", "revision_conflict"].includes(error.code || error.message)) {
+          selection.error += " Нажмите «Обновить список», чтобы получить актуальные коммиты из remote.";
+        }
+      }
+    } finally {
+      if (requestId === selection.requestId) {
+        selection.pending = false;
+        renderSelectionStatus();
+      }
+    }
+  }
+
+  async function applyCommitSelection() {
+    if (selection.pending || selection.error || !selection.repositories || !root.RdvCommitSelection.selectionState(selection.repositories, selection.boundaries).canApply) return;
+    selection.pending = true;
+    renderSelectionStatus();
+    try {
+      selection.draft = await root.RdvCommitSelection.request(chrome.runtime, "apply", {
+        draftId: selection.draft.draftId, revision: selection.draft.revision, boundaries: selection.boundaries
+      });
+      selection.boundaries = selection.draft.boundaries;
+      selection.applied = true;
+    } catch (error) {
+      selection.error = selectionMessage(error);
+    } finally {
+      selection.pending = false;
+      renderSelectionStatus();
+    }
+  }
+
+  async function initCommitSelection() {
+    $("refreshCommitCandidates").addEventListener("click", () => refreshCommitCandidates(true));
+    $("applyCommitSelection").addEventListener("click", applyCommitSelection);
+    try {
+      const params = new URL(window.location.href).searchParams;
+      const draftId = params.get("draftId");
+      if (!draftId) {
+        selection.error = params.get("selectionUnavailable") === "config_missing"
+          ? "Чтобы выбрать коммиты, сначала настройте проект в расширении. Инструкцию можно сохранить сейчас."
+          : "Выбор коммитов недоступен. Проверьте настройки проекта и работу локального сервиса, затем откройте страницу заново из расширения. Инструкцию можно сохранить сейчас.";
+        renderSelectionStatus();
+        return;
+      }
+      selection.draft = await root.RdvCommitSelection.request(chrome.runtime, "read", { draftId });
+      if (selection.draft.context.issueKey !== state.issueKey) throw new Error("stale_draft");
+      selection.boundaries = selection.draft.boundaries;
+      await refreshCommitCandidates(false);
+    } catch (error) {
+      selection.error = selectionMessage(error);
+      renderSelectionStatus();
+    }
+  }
 
   function characterCount(value) {
     return `${root.RdvUserInstructionStore.codePointCount(String(value || ""))} / ${root.RdvUserInstructionStore.MAX_LENGTH}`;
@@ -433,6 +647,7 @@
     }
     renderDraftState();
     await loadInstruction();
+    void initCommitSelection();
   }
 
   if (typeof document !== "undefined") {

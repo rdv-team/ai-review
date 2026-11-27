@@ -71,10 +71,14 @@ class LocalReviewHandler(BaseHTTPRequestHandler):
                 return service.put_prefix_config(parts[1], self._json_body())
         if method == "POST" and parts == ["reviews"]:
             return service.create_review(self._json_body())
+        if method == "POST" and parts == ["reviews", "commit-candidates"]:
+            return service.commit_candidates(self._json_body())
         if method == "GET" and len(parts) == 3 and parts[:2] == ["reviews", "by-issue"]:
             return service.get_review_by_issue(parts[2])
         if method == "GET" and len(parts) == 4 and parts[:3] == ["gitlab", "merge-requests", "by-issue"]:
             return service.discover_merge_requests_by_issue(parts[3])
+        if method == "GET" and len(parts) == 4 and parts[0] == "reviews" and parts[2] == "report-versions":
+            return service.get_report_version(parts[1], parts[3])
         if len(parts) == 3 and parts[0] == "reviews":
             job_id, action = parts[1], parts[2]
             if method == "GET" and action == "status":
@@ -83,11 +87,15 @@ class LocalReviewHandler(BaseHTTPRequestHandler):
                 return service.get_summary(job_id)
             if method == "GET" and action == "report":
                 return service.get_report(job_id)
-            if action == "feedback":
+            if method == "GET" and action == "report-versions":
+                return service.get_report_versions(job_id)
+            if method == "PUT" and action == "report-suggestion":
+                return service.put_report_suggestion(job_id, self._json_body())
+            if action == "report-state":
                 if method == "GET":
-                    return service.get_feedback(job_id)
+                    return service.get_report_state(job_id)
                 if method == "PUT":
-                    return service.put_feedback(job_id, self._json_body())
+                    return service.put_report_state(job_id, self._json_body())
             if method == "GET" and action == "reasoning":
                 return service.get_reasoning(job_id)
             if method == "GET" and action == "diagnostics":
@@ -100,6 +108,8 @@ class LocalReviewHandler(BaseHTTPRequestHandler):
                 return service.open_review_bsl(job_id)
             if method == "POST" and action == "open-changes":
                 return service.open_changes(job_id)
+            if method == "POST" and action == "discussion":
+                return service.open_discussion(job_id, self._json_body())
             if method == "POST" and action == "open-log":
                 return service.open_job_log(job_id, self._json_body())
         return 404, structured_error("not_found", "Endpoint not found.")

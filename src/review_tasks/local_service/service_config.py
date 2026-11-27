@@ -20,6 +20,7 @@ DEFAULT_DRAIN_TIMEOUT_SEC = 60
 DEFAULT_AUTO_RELOAD = True
 DEFAULT_CONFIG_WATCH_INTERVAL_SEC = 60
 DEFAULT_CURSOR_MODEL = "composer-2.5-fast"
+DEFAULT_OPENCODE_CLI_VERSION = "v2"
 
 
 class ConfigSource(str, Enum):
@@ -43,6 +44,7 @@ class EffectiveServiceConfig:
     codex_bin: str | None
     cursor_bin: str | None
     opencode_bin: str | None
+    opencode_cli_version: str
     cursor_model: str | None
     log_file: Path
     max_concurrent_reviews: int
@@ -110,13 +112,17 @@ def save_service_config(path: Path, config: dict[str, Any]) -> None:
 def normalize_service_config(config: dict[str, Any]) -> dict[str, Any]:
     normalized: dict[str, Any] = {}
     for key, value in config.items():
-        if value is None:
+        if value is None and key != "opencodeCliVersion":
             continue
         normalized[key] = _normalize_config_field(key, value)
     return normalized
 
 
 def _normalize_config_field(key: str, value: Any) -> Any:
+    if key == "opencodeCliVersion":
+        if not isinstance(value, str) or value not in {"v1", "v2"}:
+            raise ApiError("invalid_service_config", "opencodeCliVersion must be v1 or v2.")
+        return value
     if key == "host":
         if not isinstance(value, str) or not value.strip():
             raise ApiError("invalid_service_config", "host must be a non-empty string.")
@@ -316,6 +322,8 @@ def resolve_effective_service_config(
     )
     gitlab_instances = normalize_gitlab_instances(file_config.get("gitlabInstances"))
     gitlab_instances_source = ConfigSource.FILE if "gitlabInstances" in file_config else ConfigSource.DEFAULT
+    opencode_cli_version = file_config.get("opencodeCliVersion", DEFAULT_OPENCODE_CLI_VERSION)
+    opencode_cli_version_source = ConfigSource.FILE if "opencodeCliVersion" in file_config else ConfigSource.DEFAULT
 
     return EffectiveServiceConfig(
         host=str(host),
@@ -324,6 +332,7 @@ def resolve_effective_service_config(
         codex_bin=codex_bin,
         cursor_bin=cursor_bin,
         opencode_bin=opencode_bin,
+        opencode_cli_version=opencode_cli_version,
         cursor_model=cursor_model,
         log_file=Path(str(log_file_raw)).expanduser().resolve(),
         max_concurrent_reviews=int(max_concurrent),
@@ -340,6 +349,7 @@ def resolve_effective_service_config(
             "codex_bin": codex_source,
             "cursor_bin": cursor_source,
             "opencode_bin": opencode_source,
+            "opencode_cli_version": opencode_cli_version_source,
             "cursor_model": cursor_model_source,
             "log_file": log_file_source,
             "max_concurrent_reviews": max_concurrent_source,

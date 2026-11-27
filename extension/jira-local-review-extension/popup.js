@@ -4,6 +4,7 @@
 
   const changesAction = root.RdvChangesAction || (typeof require !== "undefined" ? require("./changes-action.js") : null);
   const openChanges = changesAction.openChanges;
+  const commitSelection = root.RdvCommitSelection || (typeof require !== "undefined" ? require("./commit-selection-store.js") : null);
 
   const state = {
     context: null,
@@ -23,6 +24,9 @@
     sourceModeTouched: false,
     selectedMrKey: null,
     sourceIssueKey: null,
+    sessionSource: null,
+    sourceRestoredForIssue: null,
+    sourceChoiceRevision: 0,
     mrDiscoveryLoadedForIssue: null,
     mrDiscoveryPending: false,
     mrDiscoveryRequestId: 0
@@ -393,17 +397,15 @@
     };
   }
 
-  function mergeRequestCandidates(context, status) {
+  function mergeRequestCandidates(context, status, sessionSource = null) {
     const mergeRequests = normalizeMergeRequests(context);
-    const fromStatus = normalizeMrSource(status && status.source);
-    if (!fromStatus) {
-      return mergeRequests;
+    for (const source of [status && status.source, sessionSource]) {
+      const candidate = normalizeMrSource(source);
+      if (candidate && !mergeRequests.some((mr) => mergeRequestKey(mr) === mergeRequestKey(candidate))) {
+        mergeRequests.push(candidate);
+      }
     }
-    const statusKey = mergeRequestKey(fromStatus);
-    if (mergeRequests.some((mr) => mergeRequestKey(mr) === statusKey)) {
-      return mergeRequests;
-    }
-    return [...mergeRequests, fromStatus];
+    return mergeRequests;
   }
 
   function sourceKeyFromStatus(status) {
@@ -415,7 +417,7 @@
   }
 
   function syncReviewSourceState(previous, context, status) {
-    const mergeRequests = mergeRequestCandidates(context, status);
+    const mergeRequests = mergeRequestCandidates(context, status, previous.sessionSource);
     const keys = new Set(mergeRequests.map(mergeRequestKey));
     const statusKey = sourceKeyFromStatus(status);
     const issueKey = context && context.issueKey ? context.issueKey : "";
@@ -459,7 +461,7 @@
 
   function selectedMergeRequest() {
     const key = state.selectedMrKey;
-    return mergeRequestCandidates(state.context, state.status).find((mr) => mergeRequestKey(mr) === key) || null;
+    return mergeRequestCandidates(state.context, state.status, state.sessionSource).find((mr) => mergeRequestKey(mr) === key) || null;
   }
 
   function buildSourceInit(mode, selectedMrKey, mergeRequests) {
@@ -488,8 +490,73 @@
     return buildSourceInit(
       state.reviewSourceMode,
       state.selectedMrKey,
-      mergeRequestCandidates(state.context, state.status)
+      mergeRequestCandidates(state.context, state.status, state.sessionSource)
     );
+  }
+
+  function currentSelectionContext() {
+    return { issueKey: state.context.issueKey, mode: state.reviewSourceMode, init: buildCurrentSourceInit() };
+  }
+
+  async function restoreCommitSelectionSource(issueKey) {
+    if (!issueKey || state.sourceRestoredForIssue === issueKey) return;
+    const choiceRevision = state.sourceChoiceRevision;
+    const draft = await commitSelection.request(chrome.runtime, "current", { issueKey });
+    if (choiceRevision === state.sourceChoiceRevision) {
+      state.sessionSource = draft && draft.context.mode === "mr" && draft.context.init
+        ? { mode: "mr", ...draft.context.init } : null;
+      if (draft) {
+        state.sourceIssueKey = issueKey;
+        state.reviewSourceMode = draft.context.mode;
+        state.sourceModeTouched = true;
+        state.selectedMrKey = state.sessionSource ? mergeRequestKey(state.sessionSource) : null;
+      }
+    }
+    state.sourceRestoredForIssue = issueKey;
+  }
+
+  async function activateCommitSelection() {
+    await restoreCommitSelectionSource(state.context.issueKey);
+    return commitSelection.request(chrome.runtime, "activate", { context: currentSelectionContext() });
+  }
+
+  async function syncCommitSelection() {
+    if (!state.context || !state.context.issueKey || !state.config) return;
+    try {
+      await activateCommitSelection();
+    } catch (error) {
+      state.status = Object.assign({}, state.status || {}, {
+        feedback: { code: "commit_selection_unavailable", tone: "error", title: "Не удалось проверить границу", message: error.message }
+      });
+    }
+  }
+
+  function initWithBoundaries(init, boundaries) {
+    return boundaries.length ? { ...(init || {}), afterCommits: boundaries } : init;
+  }
+
+  async function createReviewWithSelection(apiClient, payload, runtime, draftId) {
+    const draft = await commitSelection.request(runtime, "read", { draftId });
+    const request = { ...payload, init: initWithBoundaries(payload.init, draft.boundaries) };
+    if (!request.init) delete request.init;
+    let response;
+    try {
+      response = await apiClient.createReview(request);
+    } catch (error) {
+      const failure = error.body && error.body.error;
+      if (draft.boundaries.length && failure && failure.code === "unsupported_field" &&
+          failure.details && Array.isArray(failure.details.fields) && failure.details.fields.includes("afterCommits")) {
+        error.message = "Локальный сервис не поддерживает выбор границы. Обновите сервис и повторите запуск.";
+      }
+      throw error;
+    }
+    try {
+      await commitSelection.request(runtime, "consume", { draftId });
+      return response;
+    } catch (error) {
+      // Acceptance cannot be undone by a storage failure after HTTP 202.
+      return { ...response, selectionResetError: error.message };
+    }
   }
 
   function normalizeDiscoveryResponse(response, issueKey) {
@@ -725,10 +792,19 @@
     }
   }
 
-  function buildInstructionEditorTabOptions(issueKey, runtime, openerTabId) {
-    const url = root.RdvUserInstructionStore.buildEditorUrl(issueKey, runtime);
+  function buildInstructionEditorTabOptions(issueKey, runtime, openerTabId, draftId, selectionUnavailable) {
+    let url = root.RdvUserInstructionStore.buildEditorUrl(issueKey, runtime);
     if (!url) {
       return null;
+    }
+    if (draftId) {
+      const parsed = new URL(url);
+      parsed.searchParams.set("draftId", draftId);
+      url = parsed.href;
+    } else if (selectionUnavailable) {
+      const parsed = new URL(url);
+      parsed.searchParams.set("selectionUnavailable", selectionUnavailable);
+      url = parsed.href;
     }
     const options = { url, active: true };
     if (typeof openerTabId === "number") {
@@ -737,10 +813,10 @@
     return options;
   }
 
-  async function createInstructionEditorTab(issueKey, chromeRef) {
+  async function createInstructionEditorTab(issueKey, chromeRef, draftId, selectionUnavailable) {
     try {
       const [tab] = await chromeRef.tabs.query({ active: true, currentWindow: true });
-      const options = buildInstructionEditorTabOptions(issueKey, chromeRef.runtime, tab && tab.id);
+      const options = buildInstructionEditorTabOptions(issueKey, chromeRef.runtime, tab && tab.id, draftId, selectionUnavailable);
       if (!options) {
         return false;
       }
@@ -755,11 +831,23 @@
     if (!isSupportedJiraIssueContext(state.context)) {
       return false;
     }
-    return createInstructionEditorTab(state.context.issueKey, chrome);
+    if (state.status && state.status.detailStatus === "config_missing") {
+      return createInstructionEditorTab(state.context.issueKey, chrome, null, "config_missing");
+    }
+    try {
+      const draft = await activateCommitSelection();
+      return createInstructionEditorTab(state.context.issueKey, chrome, draft.draftId);
+    } catch (error) {
+      state.status = Object.assign({}, state.status || {}, {
+        feedback: { code: "commit_selection_unavailable", tone: "error", title: "Не удалось открыть выбор границы", message: error.message }
+      });
+      render();
+      return createInstructionEditorTab(state.context.issueKey, chrome, null, "unavailable");
+    }
   }
 
   function renderSourceSelector(context) {
-    const mergeRequests = mergeRequestCandidates(context, state.status);
+    const mergeRequests = mergeRequestCandidates(context, state.status, state.sessionSource);
     const taskButton = $("sourceTask");
     const mrButton = $("sourceMr");
     const list = $("mrList");
@@ -953,8 +1041,6 @@
     $("criticalCount").textContent = String(summary.criticalCount || 0);
     $("majorCount").textContent = String(summary.majorCount || 0);
     $("minorCount").textContent = String(summary.minorCount || 0);
-    $("summaryText").textContent = summary.summaryText || "";
-    $("summaryText").hidden = !summary.summaryText;
     $("tokenUsage").textContent = status.tokenUsage || summary.tokenUsage ? String(status.tokenUsage || summary.tokenUsage) : "—";
   }
 
@@ -1080,6 +1166,14 @@
 
   async function refreshAll(options = {}) {
     const bundle = await getActiveIssueBundle();
+    try {
+      await restoreCommitSelectionSource(bundle.context.issueKey);
+    } catch (error) {
+      renderCachedIssueState(bundle);
+      state.status = { detailStatus: "service_unavailable", availableActions: ["refresh"], error: { code: "commit_selection_unavailable", message: error.message } };
+      render();
+      return;
+    }
     renderCachedIssueState(bundle);
     await refreshInstructionState(bundle.context.issueKey);
     if (!bundle.context.ok) {
@@ -1132,7 +1226,19 @@
       await loadMrDiscoveryForCurrentIssue();
     }
     await notifyIssueStatusChanged();
+    await syncCommitSelection();
     render();
+  }
+
+  function playSwiftFlight() {
+    const logo = document.querySelector(".brand-logo");
+    if (!logo || root.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      return;
+    }
+    logo.classList.remove("swift-flying");
+    void logo.offsetWidth;
+    logo.classList.add("swift-flying");
+    logo.addEventListener("animationend", () => logo.classList.remove("swift-flying"), { once: true });
   }
 
   async function submitReview(options) {
@@ -1167,6 +1273,12 @@
       state.instructionSet = userInstruction !== null;
       state.instructionLoading = false;
       state.instructionError = null;
+      const selectionContext = currentSelectionContext();
+      if (selectionContext.mode === "mr" && !selectionContext.init) throw new Error("Сначала выберите MR.");
+      const draft = await activateCommitSelection();
+      if (await getActiveIssueKey(chrome) !== issueKey || commitSelection.identity(selectionContext) !== commitSelection.identity(currentSelectionContext())) {
+        throw new Error("stale_issue_context");
+      }
       const payload = root.RdvLocalReviewApi.buildReviewRequest({
         context: state.context,
         ide: state.config && state.config.ide ? state.config.ide : "codex",
@@ -1176,12 +1288,20 @@
             ? state.config.timeoutSec
             : root.RdvLocalReviewApi.DEFAULT_TIMEOUT_SEC
         ),
-        init: buildCurrentSourceInit(),
+        init: selectionContext.init,
         runner: handoff ? { mode: "handoff" } : null,
         userInstruction
       });
-      const response = await state.api.createReview(payload);
+      const response = await createReviewWithSelection(state.api, payload, chrome.runtime, draft.draftId);
       state.status = response.status;
+      if (response.selectionResetError) {
+        state.status = Object.assign({}, state.status, {
+          feedback: { code: "commit_selection_reset_failed", tone: "error", title: "Запуск принят; граница не сброшена", message: "Откройте «Инструкция агенту» и явно выберите «Все коммиты» перед следующим запуском." }
+        });
+      }
+      if (!handoff) {
+        playSwiftFlight();
+      }
       await sendRuntimeMessage({ type: "refreshIssueStatus", issueKey });
       await notifyIssueStatusChanged();
       return true;
@@ -1294,10 +1414,12 @@
   }
 
   async function setSourceMode(mode) {
+    state.sourceChoiceRevision += 1;
     state.reviewSourceMode = mode;
     state.sourceModeTouched = true;
     resetConfirmStates();
     render();
+    await syncCommitSelection();
     if (
       mode === "mr" &&
       state.context &&
@@ -1306,6 +1428,7 @@
     ) {
       await loadMrDiscoveryForCurrentIssue();
     }
+    await syncCommitSelection();
   }
 
   function handleMrListClick(event) {
@@ -1313,11 +1436,13 @@
     if (!button) {
       return;
     }
+    state.sourceChoiceRevision += 1;
     state.selectedMrKey = button.dataset.mrKey;
     state.reviewSourceMode = "mr";
     state.sourceModeTouched = true;
     resetConfirmStates();
     render();
+    void syncCommitSelection();
   }
 
   async function cancelReview() {
@@ -1506,6 +1631,8 @@
       openChanges,
       openProjectConfig,
       openInstructionEditor,
+      initWithBoundaries,
+      createReviewWithSelection,
       isSupportedJiraIssueContext,
       mergeRequestCandidates,
       mergeRequestKey,

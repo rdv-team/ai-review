@@ -31,7 +31,7 @@ _HOT_FIELDS = (
     "gitlab_instances",
 )
 
-_RESTART_FIELDS = ("host", "port", "token", "log_file")
+_RESTART_FIELDS = ("host", "port", "token", "log_file", "opencode_cli_version")
 
 
 _FILE_JSON_KEYS: tuple[tuple[str, str], ...] = (
@@ -41,6 +41,7 @@ _FILE_JSON_KEYS: tuple[tuple[str, str], ...] = (
     ("codexBin", "codex_bin"),
     ("cursorBin", "cursor_bin"),
     ("opencodeBin", "opencode_bin"),
+    ("opencodeCliVersion", "opencode_cli_version"),
     ("cursorModel", "cursor_model"),
     ("logFile", "log_file"),
     ("maxConcurrentReviews", "max_concurrent_reviews"),
@@ -71,7 +72,9 @@ def reload_operational_config(service: LocalReviewService, *, trigger: str) -> d
 
     changes = _collect_config_changes(previous, effective)
     not_applied = _collect_not_applied_file_changes(previous_file, new_file, previous, effective)
-    notices = _restart_required_notices(previous, effective)
+    notices = _restart_required_notices(
+        previous, effective, active_opencode_cli_version=service.active_opencode_cli_version,
+    )
     apply_effective_config_env(effective)
     service._last_file_config = dict(new_file)
 
@@ -117,10 +120,12 @@ def reload_operational_config(service: LocalReviewService, *, trigger: str) -> d
 def _restart_required_notices(
     previous: EffectiveServiceConfig,
     effective: EffectiveServiceConfig,
+    *,
+    active_opencode_cli_version: str,
 ) -> list[str]:
     notices: list[str] = []
     for field in _RESTART_FIELDS:
-        old_value = getattr(previous, field)
+        old_value = active_opencode_cli_version if field == "opencode_cli_version" else getattr(previous, field)
         new_value = getattr(effective, field)
         source = effective.field_sources[field]
         if source == ConfigSource.CLI:

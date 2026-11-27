@@ -13,15 +13,27 @@
             <img class="brand-logo" src="icons/rdv-swift.svg" alt="" width="54" height="40">
             <div class="brand-copy"><span class="brand-name">RDV <em>AIR</em></span><span class="brand-tagline">AI Review</span></div>
           </div>
-          <div class="report-heading"><h1 id="title">Отчёт ревью</h1><span id="reportIssueKey" class="issue-key" hidden></span></div>
+          <div class="report-heading">
+            <h1 id="title">Отчёт ревью</h1><span id="reportIssueKey" class="issue-key" hidden></span>
+            <details id="versionControl" class="version-control" hidden>
+              <summary aria-label="Выбрать версию отчёта"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 11a9 9 0 1 1 3 8M3 4v7h7M12 7v5l3 2"/></svg><span id="versionLabel">Текущая</span><svg class="version-chevron" viewBox="0 0 12 12" aria-hidden="true"><path d="m3 4.5 3 3 3-3"/></svg></summary>
+              <nav class="version-menu" aria-label="Версии отчёта"><span class="version-menu-heading">Версия отчёта</span><div id="reportVersion"></div></nav>
+            </details>
+            <span id="readOnlyNotice" class="status-badge" hidden>Только чтение</span>
+          </div>
         </div>
         <div class="report-actions">
           <button id="previewJira" class="primary" hidden disabled>Скопировать принятые · 0</button>
           <button id="openChanges" class="secondary" type="button" hidden>Открыть изменения</button>
+          <button id="discussReport" class="secondary discussion-button" type="button" disabled aria-describedby="discussionMessage">Обсудить с агентом</button>
           <button id="copyMarkdown" class="secondary">Скопировать Markdown</button>
         </div>
       </header>
       <div id="reportPath" class="report-path"></div>
+      <div id="discussionStatus" class="discussion-status" hidden>
+        <span id="discussionMessage" role="status" aria-live="polite"></span>
+        <button id="dismissDiscussionStatus" class="subtle" type="button" aria-label="Закрыть сообщение" hidden>&times;</button>
+      </div>
       <section id="error" class="error" role="alert" hidden></section>
       <div id="statistics" class="statistics" aria-live="polite" hidden></div>
       <nav id="tabs" class="tabs" aria-label="Разделы отчёта" hidden>
@@ -40,6 +52,7 @@
               <button id="accept" class="decision-button accept-button"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 4 4L19 6"/></svg>Принять</button>
               <button id="reject" class="decision-button reject-button"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg>Отклонить</button>
               <button id="reset" class="subtle">Сбросить</button>
+              <button id="discussFinding" class="secondary discussion-button" type="button" hidden disabled aria-describedby="discussionMessage">Обсудить это замечание</button>
               <button id="toggleComment" class="comment-toggle" aria-expanded="true" aria-controls="commentEditor"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M21 15a3 3 0 0 1-3 3H8l-5 3V6a3 3 0 0 1 3-3h12a3 3 0 0 1 3 3Z"/></svg><span id="commentToggleLabel">Комментарий</span></button>
             </div>
             <div class="save-row"><span id="saveStatus" role="status" aria-live="polite"></span>
@@ -49,7 +62,7 @@
             <section id="commentEditor" class="comment-editor">
               <label for="comment">Комментарий для обратной связи <span class="muted">· необязательно</span></label>
               <textarea id="comment" rows="2" placeholder="Почему вы согласны или не согласны с замечанием"></textarea>
-              <div class="comment-footer"><span id="agentSendStatus" role="status" aria-live="polite"></span><button id="closeComment" class="subtle">Свернуть</button><button id="sendAgent" class="primary">Отправить агенту</button></div>
+              <div class="comment-footer"><span id="agentSendStatus" role="status" aria-live="polite"></span><button id="sendAgent" class="primary"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m7.7 7 8.6 4m0 2-8.6 4"/><circle cx="6" cy="6" r="2"/><circle cx="18" cy="12" r="2"/><circle cx="6" cy="18" r="2"/></svg>Сохранить в память</button></div>
             </section>
           </section>
         </section>

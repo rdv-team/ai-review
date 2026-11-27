@@ -10,10 +10,15 @@ from typing import Any, Callable
 
 from review_tasks.review_init import prefix_config
 from review_tasks.review_init.comparison import (
-    COMPARISON_LAUNCHER, ComparisonLaunchError, launch_comparison,
+    COMPARISON_LAUNCHER, ComparisonLaunchError, launch_comparison, task_lock,
 )
-from review_tasks.review_result.review_yaml import expand_review_result_inputs, read_review_yaml_documents
-from review_tasks.review_result import FeedbackError, ReviewReportFeature
+from review_tasks.review_result.review_yaml import expand_review_result_inputs
+from review_tasks.review_result import (
+    ReportStateError, ReviewReportFeature, prepare_discussion, validate_discussion_payload,
+)
+from review_tasks.review_result.history import list_report_versions, read_report_version
+from review_tasks.infrastructure.executables import resolve_executable
+from review_tasks.integrations.opencode import OpenCodeLaunchError, check_version, launch_discussion
 
 from .contracts import (
     ApiError,
@@ -21,9 +26,11 @@ from .contracts import (
     DONE_DETAIL_STATUSES,
     api_error_response,
     normalize_issue_key,
+    normalize_opencode_model,
     normalize_prefix_payload,
     is_active_status,
     normalize_review_request,
+    normalize_commit_candidates_request,
     now_iso,
     package_version,
     prefix_entry_from_api,
@@ -44,7 +51,8 @@ from .gitlab import (
 )
 from .logging_setup import log_error
 from .job_logs import JOB_LOG_SOURCES, build_log_diagnostics, job_log_path
-from .orchestrator import CommandBackend, JobOrchestrator
+from .opencode_log import OpenCodeReadableLog, READABLE_LOG_FILENAME
+from .orchestrator import CommandBackend, JobOrchestrator, PreflightError, build_init_argv, resolve_init_config
 from .service_config import (
     SERVICE_CONFIG_FILENAME,
     CliServiceOverrides,
@@ -58,7 +66,7 @@ from .storage import JobStore, read_json, safe_tail
 from .text_file_opener import open_text_file
 
 _AGENT_ACTIVE_DETAIL_STATUSES = frozenset({"review_starting", "review_running"})
-_AGENT_STDERR_BY_IDE = {
+_AGENT_LOG_BY_IDE = {
     "codex": "codex.stderr.log",
     "cursor": "cursor.stderr.log",
     "opencode": "opencode.stderr.log",
@@ -82,7 +90,8 @@ class LocalReviewService:
         gitlab_client: GitLabApiClient | None = None,
         file_opener: Callable[[Path], None] | None = None,
         changes_runner: Callable[[Path], None] | None = None,
-        feedback_root: Path | None = None,
+        discussion_launcher: Callable[[str, Path, str, Path], None] | None = None,
+        memory_root: Path | None = None,
     ) -> None:
         if effective_config is None and service_root is not None:
             candidate_config = Path(service_root).expanduser().resolve() / SERVICE_CONFIG_FILENAME
@@ -94,9 +103,10 @@ class LocalReviewService:
                 effective_config = resolve_effective_service_config(cli=config_overrides)
                 cli_overrides = cli_overrides or config_overrides
         self.store = JobStore(service_root)
-        self.report_feature = ReviewReportFeature(feedback_root)
+        self.report_feature = ReviewReportFeature(memory_root)
         self.cli_overrides = cli_overrides or CliServiceOverrides()
         self.effective_config = effective_config
+        self.active_opencode_cli_version = effective_config.opencode_cli_version if effective_config else "v2"
         self.token = token if token is not None else os.environ.get("REVIEW_TASKS_SERVICE_TOKEN")
         self.start_worker = start_worker
         self.max_concurrent_reviews = max(1, max_concurrent_reviews)
@@ -104,12 +114,14 @@ class LocalReviewService:
         self.gitlab_client = gitlab_client or GitLabApiClient()
         self.file_opener = file_opener or open_text_file
         self.changes_runner = changes_runner or launch_comparison
+        self.discussion_launcher = discussion_launcher or launch_discussion
         gitlab_instances = effective_config.gitlab_instances if effective_config is not None else ()
         self.orchestrator = JobOrchestrator(
             self.store,
             backend=backend,
             poll_interval=poll_interval,
             gitlab_instances=gitlab_instances,
+            opencode_cli_version=self.active_opencode_cli_version,
         )
         self._state_lock = threading.RLock()
         self._reconcile_done = False
@@ -236,8 +248,11 @@ class LocalReviewService:
         try:
             request = normalize_review_request(payload)
             self._validate_selected_mr_request(request)
+            build_init_argv(request)
         except ApiError as exc:
             return exc.status, api_error_response(exc)
+        except PreflightError as exc:
+            return 400, structured_error(exc.code, str(exc), details=exc.details)
         active = self.store.find_active_by_issue(request["issueKey"])
         if active is not None:
             popup_status = status_to_popup(active)
@@ -254,6 +269,43 @@ class LocalReviewService:
         if self.start_worker and self._worker_pool is not None:
             self._worker_pool.enqueue(str(status["jobId"]))
         return 202, {"ok": True, "jobId": status["jobId"], "status": status_to_popup(status)}
+
+    def commit_candidates(self, payload: Any) -> tuple[int, dict[str, Any]]:
+        from review_tasks.review_init.commit_source import project_commit_candidates, resolve_commit_sources
+
+        try:
+            request = normalize_commit_candidates_request(payload)
+            self._validate_selected_mr_request(request)
+            resolved = resolve_init_config(request, source_only=True)
+            repositories = prefix_config.resolve_repository_entries(
+                prefix_config.split_repository_list(resolved["repoPath"])
+            )
+            resolved["gitBin"] = resolve_executable("git", env_var="REVIEW_TASKS_GIT_BIN") or "git"
+            selected = self.orchestrator.resolve_selected_mr_source(request, resolved, repositories)
+            if selected is not None:
+                repositories = [Path(selected["repoPath"])]
+            init = request["init"]
+            if init.get("mrId") and len(repositories) != 1:
+                raise ApiError("invalid_request", "MR source requires one matched repository.")
+            records = resolve_commit_sources(
+                request["issueKey"], repositories, resolved["branch"], resolved["remote"],
+                # Service init always passes the resolved branch through -b.
+                True, mr_id=init.get("mrId"), refresh=request["refresh"],
+            )
+            groups = project_commit_candidates(records)
+            source = selected or {
+                "mode": "mr" if init.get("mrId") else "task",
+                **({"mrId": init["mrId"]} if init.get("mrId") else {}),
+                "repoPath": prefix_config.repositories_to_api_value([str(repo) for repo in repositories]),
+                "branch": resolved["branch"], "remote": resolved["remote"],
+            }
+            return 200, {"ok": True, "issueKey": request["issueKey"], "source": source, "repositories": groups}
+        except ApiError as exc:
+            return exc.status, api_error_response(exc)
+        except PreflightError as exc:
+            return 400, structured_error(exc.code, str(exc), details=exc.details)
+        except (OSError, ValueError, RuntimeError) as exc:
+            return 400, structured_error("commit_candidates_failed", str(exc))
 
     def discover_merge_requests_by_issue(self, issue_key: str) -> tuple[int, dict[str, Any]]:
         try:
@@ -374,46 +426,202 @@ class LocalReviewService:
         report_path = status.get("reportPath")
         if not isinstance(report_path, str) or not Path(report_path).exists():
             return 404, structured_error("report_unavailable", "Report is unavailable.")
-        content = Path(report_path).read_text(encoding="utf-8")
-        payload: dict[str, Any] = {"ok": True, "reportPath": report_path, "content": content}
+        payload: dict[str, Any] = {"ok": True, "reportPath": report_path}
         issue_key = status.get("issueKey")
         if isinstance(issue_key, str) and issue_key.strip():
             payload["issueKey"] = issue_key.strip()
+        task_dir = Path(report_path).parent
         try:
-            task_dir, task = self._feedback_context(status)
-            payload["view"] = self.report_feature.get_report(task_dir, task)
-        except FeedbackError as exc:
+            task_dir, task = self._report_state_context(status)
+            with task_lock(task_dir):
+                payload["content"] = Path(report_path).read_text(encoding="utf-8")
+                payload["view"] = self.report_feature.get_report(task_dir, task)
+                if self.report_feature.can_edit_suggestions(task_dir):
+                    payload["canEditSuggestions"] = True
+        except ReportStateError as exc:
             payload["view"] = None
             payload["viewError"] = {"code": exc.code, "message": str(exc)}
+        except OSError as exc:
+            payload["view"] = None
+            payload["viewError"] = {"code": "report_state_unavailable", "message": str(exc)}
+        if "content" not in payload:
+            with task_lock(task_dir):
+                payload["content"] = Path(report_path).read_text(encoding="utf-8")
+        try:
+            self._discussion_context(job_id, status)
+            payload["discussion"] = {"available": True, "reason": None}
+        except ReportStateError as exc:
+            payload["discussion"] = {
+                "available": False, "reason": {"code": exc.code, "message": str(exc)},
+            }
         return 200, payload
 
+    def get_report_versions(self, job_id: str) -> tuple[int, dict[str, Any]]:
+        status = self.store.read_status(job_id)
+        if status is None:
+            return 404, structured_error("not_found", f"Unknown jobId: {job_id}")
+        try:
+            task_dir, _task = self._report_state_context(status)
+            versions = list_report_versions(task_dir)
+            report_path = status.get("reportPath")
+            current_available = isinstance(report_path, str) and Path(report_path).is_file()
+            return 200, {"ok": True, "currentAvailable": current_available, "versions": versions}
+        except ReportStateError as exc:
+            return exc.status, exc.response()
+        except (OSError, ValueError, RuntimeError) as exc:
+            return 500, structured_error("report_archive_read_failed", str(exc))
+
+    def get_report_version(self, job_id: str, version_id: str) -> tuple[int, dict[str, Any]]:
+        status = self.store.read_status(job_id)
+        if status is None:
+            return 404, structured_error("not_found", f"Unknown jobId: {job_id}")
+        try:
+            task_dir, task = self._report_state_context(status)
+            return 200, read_report_version(task_dir, task, version_id)
+        except ReportStateError as exc:
+            return exc.status, exc.response()
+        except (OSError, ValueError, RuntimeError) as exc:
+            return 500, structured_error("report_archive_read_failed", str(exc))
+
+    def _discussion_context(
+        self, job_id: str, status: dict[str, Any],
+    ) -> tuple[dict[str, Any], Path, str]:
+        try:
+            request = self.store.read_request(job_id)
+        except (OSError, ValueError) as exc:
+            raise ReportStateError(409, "discussion_unavailable", "Сохранённый контекст задачи недоступен.") from exc
+        if not isinstance(request, dict):
+            raise ReportStateError(409, "discussion_unavailable", "Сохранённый контекст задачи недоступен.")
+        ide = request.get("ide")
+        if ide in ("cursor", "codex"):
+            raise ReportStateError(
+                409, "discussion_unsupported",
+                "Обсуждение из отчета пока поддерживается только для OpenCode",
+            )
+        if ide != "opencode":
+            raise ReportStateError(409, "discussion_unavailable", "Агент завершённого ревью неизвестен.")
+        if sys.platform != "win32":
+            raise ReportStateError(409, "discussion_unavailable", "Открытие обсуждения поддерживается только в Windows.")
+        try:
+            task_dir, task = self._report_state_context(status)
+            if not task_dir.is_dir():
+                raise OSError("Каталог задачи отсутствует.")
+        except (ReportStateError, OSError, ValueError) as exc:
+            raise ReportStateError(409, "discussion_unavailable", "Каталог или номер задачи недоступен.") from exc
+        try:
+            skill = task_dir / ".agents" / "skills" / "review-discuss" / "SKILL.md"
+            skill.read_text(encoding="utf-8")
+        except (OSError, ValueError) as exc:
+            raise ReportStateError(
+                409, "discussion_unavailable",
+                "Скилл обсуждения недоступен. Выполните повторную подготовку задачи через init.",
+            ) from exc
+        return request, task_dir, task
+
+    def open_discussion(self, job_id: str, payload: Any) -> tuple[int, dict[str, Any]]:
+        status = self.store.read_status(job_id)
+        if status is None:
+            return 404, structured_error("not_found", f"Unknown jobId: {job_id}")
+        try:
+            validate_discussion_payload(payload)
+            request, task_dir, task = self._discussion_context(job_id, status)
+            executable = resolve_executable(
+                "opencode", "REVIEW_TASKS_OPENCODE_BIN",
+                configured=self.effective_config.opencode_bin if self.effective_config else None,
+            )
+            if not executable:
+                raise ReportStateError(
+                    409, "discussion_unavailable",
+                    "OpenCode не найден. Проверьте установку и настройку executable.",
+                )
+            try:
+                check_version(executable, self.active_opencode_cli_version)
+            except OpenCodeLaunchError as exc:
+                raise ReportStateError(409, "discussion_unavailable", str(exc)) from exc
+            try:
+                try:
+                    config = read_json(prefix_config.get_config_path())
+                except FileNotFoundError:
+                    config = {}
+                if not isinstance(config, dict):
+                    raise ValueError("Конфигурация префиксов должна быть JSON-объектом.")
+                project_key = request.get("projectKey") or prefix_config.extract_prefix(task)
+                saved = config.get(project_key, {})
+                if not isinstance(saved, dict):
+                    raise ValueError("Конфигурация проекта должна быть JSON-объектом.")
+                model = normalize_opencode_model(saved.get("opencode_model", ""))
+            except (ApiError, OSError, ValueError) as exc:
+                raise ReportStateError(
+                    409, "discussion_unavailable",
+                    f"Не удалось прочитать модель OpenCode проекта. Проверьте конфигурацию: {exc}",
+                ) from exc
+            report_path = status.get("reportPath")
+            if not isinstance(report_path, str) or not report_path.strip():
+                raise ReportStateError(409, "discussion_unavailable", "Готовый отчёт недоступен.")
+            context = prepare_discussion(task_dir, task, Path(report_path), payload, self.report_feature)
+            try:
+                self.discussion_launcher(executable, task_dir, model, context, cli_version=self.active_opencode_cli_version)
+            except OpenCodeLaunchError as exc:
+                if exc.code == "opencode_unavailable":
+                    return 409, structured_error("discussion_unavailable", str(exc))
+                return 500, structured_error("discussion_open_failed", str(exc))
+            except Exception as exc:
+                raise ReportStateError(500, "discussion_open_failed", f"Не удалось открыть терминал OpenCode: {exc}") from exc
+        except ReportStateError as exc:
+            return exc.status, exc.response()
+        except OSError as exc:
+            return 500, structured_error("discussion_open_failed", f"Не удалось открыть обсуждение: {exc}")
+        return 200, {"ok": True, "jobId": job_id}
+
     @staticmethod
-    def _feedback_context(status: dict[str, Any]) -> tuple[Path, str]:
+    def _report_state_context(status: dict[str, Any]) -> tuple[Path, str]:
         task_dir = status.get("taskDir")
         task = status.get("issueKey")
         if not isinstance(task_dir, str) or not task_dir.strip() or not isinstance(task, str) or not task.strip():
-            raise FeedbackError(409, "feedback_unavailable", "Каталог или номер задачи недоступен.")
+            raise ReportStateError(409, "report_state_unavailable", "Каталог или номер задачи недоступен.")
         return Path(task_dir).resolve(), task.strip()
 
-    def get_feedback(self, job_id: str) -> tuple[int, dict[str, Any]]:
+    def get_report_state(self, job_id: str) -> tuple[int, dict[str, Any]]:
         status = self.store.read_status(job_id)
         if status is None:
             return 404, structured_error("not_found", f"Unknown jobId: {job_id}")
         try:
-            task_dir, task = self._feedback_context(status)
-            return 200, self.report_feature.get_feedback(task_dir, task)
-        except FeedbackError as exc:
+            task_dir, task = self._report_state_context(status)
+            with task_lock(task_dir):
+                return 200, self.report_feature.get_report_state(task_dir, task)
+        except ReportStateError as exc:
             return exc.status, exc.response()
+        except OSError as exc:
+            return 409, structured_error("report_state_unavailable", str(exc))
 
-    def put_feedback(self, job_id: str, payload: Any) -> tuple[int, dict[str, Any]]:
+    def put_report_state(self, job_id: str, payload: Any) -> tuple[int, dict[str, Any]]:
         status = self.store.read_status(job_id)
         if status is None:
             return 404, structured_error("not_found", f"Unknown jobId: {job_id}")
         try:
-            task_dir, task = self._feedback_context(status)
-            return 200, self.report_feature.put_feedback(task_dir, task, payload)
-        except FeedbackError as exc:
+            task_dir, task = self._report_state_context(status)
+            with task_lock(task_dir):
+                return 200, self.report_feature.put_report_state(task_dir, task, payload)
+        except ReportStateError as exc:
             return exc.status, exc.response()
+        except OSError as exc:
+            return 409, structured_error("report_state_unavailable", str(exc))
+
+    def put_report_suggestion(self, job_id: str, payload: Any) -> tuple[int, dict[str, Any]]:
+        status = self.store.read_status(job_id)
+        if status is None:
+            return 404, structured_error("not_found", f"Unknown jobId: {job_id}")
+        try:
+            task_dir, task = self._report_state_context(status)
+            report_path = status.get("reportPath")
+            if not isinstance(report_path, str) or not Path(report_path).is_file():
+                raise ReportStateError(409, "report_state_unavailable", "Готовый отчёт недоступен.")
+            with task_lock(task_dir):
+                return 200, self.report_feature.put_report_suggestion(task_dir, task, Path(report_path), payload)
+        except ReportStateError as exc:
+            return exc.status, exc.response()
+        except OSError as exc:
+            return 500, structured_error("report_suggestion_write_failed", str(exc))
 
     def get_reasoning(self, job_id: str) -> tuple[int, dict[str, Any]]:
         status = self.store.read_status(job_id)
@@ -447,14 +655,29 @@ class LocalReviewService:
             request = self.store.read_request(job_id)
         except (OSError, ValueError):
             return 404, structured_error("agent_log_unavailable", "Persisted review request is unavailable.")
-        stderr_name = _AGENT_STDERR_BY_IDE.get(request.get("ide"))
-        if stderr_name is None:
+        log_name = _AGENT_LOG_BY_IDE.get(request.get("ide"))
+        if request.get("ide") == "opencode" and status.get("opencodeCliVersion") == "v2":
+            log_name = READABLE_LOG_FILENAME
+        if log_name is None:
             return 409, structured_error("unsupported_ide", "The persisted review IDE has no agent log mapping.")
         run_dir_value = status.get("runDir")
         if not isinstance(run_dir_value, str) or not run_dir_value.strip():
             return 404, structured_error("agent_log_unavailable", "Persisted run directory is unavailable.")
         try:
-            log_path = (Path(run_dir_value).expanduser().resolve() / stderr_name).resolve()
+            log_path = (Path(run_dir_value).expanduser().resolve() / log_name).resolve()
+            if log_name == READABLE_LOG_FILENAME and not log_path.is_file():
+                if status.get("detailStatus") == "done":
+                    with self._state_lock:
+                        if not log_path.is_file():
+                            OpenCodeReadableLog(
+                                log_path.with_name("opencode.stdout.log"), log_path.with_name("opencode.stderr.log"), log_path,
+                                executable=resolve_executable(
+                                    "opencode", "REVIEW_TASKS_OPENCODE_BIN",
+                                    configured=self.effective_config.opencode_bin if self.effective_config else None,
+                                ),
+                            ).update(final=True)
+                if not log_path.is_file():
+                    log_path = log_path.with_name("opencode.stdout.log")
         except OSError:
             return 404, structured_error("agent_log_unavailable", "Persisted agent log path is unavailable.")
         if not log_path.is_file():
@@ -574,6 +797,8 @@ class LocalReviewService:
             "opencodeStdoutTail": safe_tail(run_dir / "opencode.stdout.log"),
             "cursorArgv": status.get("cursorArgv"),
             "opencodeArgv": status.get("opencodeArgv"),
+            "opencodeCliVersion": self.active_opencode_cli_version,
+            "opencodeVersion": status.get("opencodeVersion"),
             "entries": build_log_diagnostics(run_dir, [source.ref for source in JOB_LOG_SOURCES]),
         }
 
@@ -624,10 +849,59 @@ class LocalReviewService:
         return self._has_readable_path(candidate.get("reportPath"))
 
     def _same_review_target(self, candidate: dict[str, Any], latest: dict[str, Any]) -> bool:
-        return self._selected_mr_identity(candidate) == self._selected_mr_identity(latest)
+        if self._selected_mr_identity(candidate) != self._selected_mr_identity(latest):
+            return False
+        candidate_scope = self._commit_scope_identity(candidate)
+        latest_scope = self._commit_scope_identity(latest)
+        return candidate_scope is not None and candidate_scope == latest_scope
+
+    def _commit_scope_identity(self, status: dict[str, Any]) -> tuple[Any, ...] | None:
+        request: dict[str, Any] = {}
+        job_id = status.get("jobId")
+        if isinstance(job_id, str) and job_id:
+            try:
+                request = self.store.read_request(job_id)
+            except (OSError, ValueError):
+                pass
+        selection = status.get("commitSelection") or request.get("commitSelection")
+        boundaries = status.get("afterCommits") or (request.get("init") or {}).get("afterCommits")
+        # A new already_done job points at an unchanged report, whose scope
+        # cannot be inferred from this job's requested boundaries. Legacy jobs
+        # lack the scope field and retain the historical full-review behavior.
+        if status.get("detailStatus") == "already_done" and "commitSelection" in status and selection is None:
+            return None
+        if not boundaries and not (isinstance(selection, dict) and selection.get("mode") == "after"):
+            return ("all",)
+        if not isinstance(selection, dict) or selection.get("mode") != "after":
+            return None
+        try:
+            from review_tasks.review_init.commit_source import normalize_after_commits, normalize_repository_path, validate_commit_sha
+
+            requested = boundaries or selection["boundaries"]
+            boundary_map = normalize_after_commits([(item["repoPath"], item["sha"]) for item in requested], Path.cwd())
+            actual_boundaries = normalize_after_commits(
+                [(item["repoPath"], item["sha"]) for item in selection["boundaries"]], Path.cwd()
+            )
+            if not boundary_map or boundary_map != actual_boundaries:
+                return None
+            repos = []
+            for repo in selection["repositories"]:
+                path = normalize_repository_path(repo["repoPath"])
+                target = validate_commit_sha(repo["target"]) if repo["target"] else ""
+                commits = tuple(sorted(validate_commit_sha(sha) for sha in repo["commits"]))
+                if (commits and not target) or len(set(commits)) != len(commits):
+                    return None
+                repos.append((path, target, commits))
+            if not repos or len({repo[0] for repo in repos}) != len(repos):
+                return None
+            return ("after", tuple(sorted(boundary_map.items())), tuple(sorted(repos)))
+        except (ValueError, TypeError, KeyError, AttributeError):
+            return None
 
     def _selected_mr_identity(self, status: dict[str, Any]) -> tuple[str | None, int, str] | None:
         identity = self._selected_mr_identity_from_mapping(status.get("source"))
+        if identity is None and isinstance(status.get("commitSelection"), dict):
+            identity = self._selected_mr_identity_from_mapping(status["commitSelection"].get("source"))
         if identity is not None:
             return identity
         job_id = status.get("jobId")
@@ -900,12 +1174,6 @@ class LocalReviewService:
                 merged = {**disk_summary, **summary}
                 summary = merged
 
-        if not summary.get("summaryText") and task_dir.exists():
-            text = self._summary_text_from_yaml(task_dir)
-            if text:
-                summary["summaryText"] = text
-                changed = True
-
         if not status.get("reasoningPath"):
             reasoning_path = summary.get("resultYamlPath")
             if not isinstance(reasoning_path, str) or not Path(reasoning_path).exists():
@@ -943,20 +1211,6 @@ class LocalReviewService:
 
                 write_json(summary_path, summary)
         return status
-
-    @staticmethod
-    def _summary_text_from_yaml(task_dir: Path) -> str | None:
-        review_info = task_dir / "_review_info"
-        yaml_paths = expand_review_result_inputs([review_info])
-        if not yaml_paths:
-            return None
-        try:
-            documents = read_review_yaml_documents(yaml_paths)
-        except Exception:
-            return None
-        blocks = [doc.parsed.summary.strip() for doc in documents]
-        blocks = [block for block in blocks if block]
-        return "\n\n".join(blocks) if blocks else None
 
     @staticmethod
     def _reasoning_path_from_task_dir(task_dir: Path) -> str | None:

@@ -68,6 +68,7 @@ from .infrastructure.git import (
     run_git,
 )
 from .infrastructure.text_files import read_text_safe, write_text_lf
+from .repository_context import prepare_sources, write_sources
 from .integrations.gitlab_links import (
     is_git_commit_sha,
     normalize_git_remote_project_url,
@@ -80,9 +81,16 @@ from .index_json.build import indexes_from_parsed, iter_parsed_sources, object_m
 from .index_json.config_xml import GitConfigSource, compute_config_root
 from .reference_catalog import ReferenceCatalogError, write_reference_catalog
 from .review_init import prefix_config
+from .review_init.commit_source import (
+    Commit, RepositoryContext, SourceResolution, _fetch_and_resolve_repository,
+    _resolve_repo_root, build_commit_selection, find_commits_for_tasks,
+    normalize_after_commits, normalize_repository_path, restrict_sources, resolve_mr_source,
+    resolve_mr_sources_from_tasks, resolve_task_source,
+    validate_source_identity,
+)
 from .review_init.agent_skills import SkillProjectionError, project_agent_skills
 from .review_init.prompt_config import ConfigError, EffectiveConfig, ReviewPromptConfig, load_effective_config
-from .review_init.result import InitResultContext, InitResultEnvelope, InitResultEnvelopeV2, write_init_result
+from .review_init.result import InitResultContext, InitResultEnvelope, InitResultEnvelopeV2, InitResultEnvelopeV3, write_init_result
 from .review_result.review_yaml import (
     ReviewYamlError,
     expand_review_result_inputs,
@@ -92,11 +100,8 @@ from .review_result.review_yaml import (
     read_stage_pair_for_render,
     write_combined_result,
 )
-from .sgr_schema import (
-    render_field_constraints_note,
-    render_focus_areas_list,
-    render_sgr_response_skeleton_body,
-)
+from .review_result.history import archive_report, preserve_report_history, restore_report_history
+from .sgr_schema import render_focus_areas_list
 from .task_capsule.user_instruction import (
     UserInstructionError,
     validate_user_instruction,
@@ -134,8 +139,13 @@ class InitResultRecorder:
     message: str | None = None
     review_dirs: list[Path] = field(default_factory=list)
     comparisons: list[ComparisonSummary] = field(default_factory=list)
+    commit_selection: dict | None = None
 
     def record_expected_stop(self, code: str, message: str, task_dir: Path) -> None:
+        if code == 'already_done':
+            # The requested source was resolved, but the existing capsule was
+            # not rebuilt. It must never acquire the newly requested scope.
+            self.commit_selection = None
         if self.outcome == "expected_stop":
             return
         self.outcome = "expected_stop"
@@ -148,8 +158,8 @@ class InitResultRecorder:
             self.review_dirs.append(review_dir)
 
     def envelope(self, exit_code: int, schema_version: int = 1) -> InitResultEnvelope:
-        if self.outcome == "expected_stop" and self.code and self.message:
-            outcome = "expected_stop"
+        if self.outcome in {"expected_stop", "failure"} and self.code and self.message:
+            outcome = self.outcome
             code = self.code
             message = self.message
         elif exit_code == EXIT_OK:
@@ -167,8 +177,10 @@ class InitResultRecorder:
                 EXIT_NO_PATHS: "Не найдены поддерживаемые изменения для ревью.",
             }.get(exit_code, "Не удалось подготовить каталог ревью.")
         task_dir = self.review_dirs[0] if len(self.review_dirs) == 1 else None
-        model = InitResultEnvelopeV2 if schema_version == 2 else InitResultEnvelope
-        extra = {"comparisons": self.comparisons} if schema_version == 2 else {}
+        model = {2: InitResultEnvelopeV2, 3: InitResultEnvelopeV3}.get(schema_version, InitResultEnvelope)
+        extra = {"comparisons": self.comparisons} if schema_version >= 2 else {}
+        if schema_version == 3:
+            extra['commit_selection'] = self.commit_selection
         return model(
             **extra,
             outcome=outcome,
@@ -245,60 +257,8 @@ def load_template(name: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Ref / репозиторий
-# ---------------------------------------------------------------------------
-
-def resolve_ref(ref: str) -> str:
-    if git_ok(["rev-parse", "--verify", "--quiet", ref]):
-        return ref
-    for alt in ("origin/master", "origin/main", "master", "main", "HEAD"):
-        if git_ok(["rev-parse", "--verify", "--quiet", alt]):
-            return alt
-    raise ToolError(f"Не удалось найти рабочий ref (начали с {ref}).", EXIT_USAGE)
-
-
-# ---------------------------------------------------------------------------
 # Коммиты и пути
 # ---------------------------------------------------------------------------
-
-@dataclass
-class Commit:
-    sha: str
-    date: str
-    subject: str
-    body: str
-
-    @property
-    def short_sha(self) -> str:
-        return self.sha[:12]
-
-
-@dataclass
-class SourceResolution:
-    """Результат шага resolve-source: общий вход для конвейера ревью.
-
-    Поле `source_kind` различает источник коммитов задачи: `"task"` (отбор по
-    `git log --grep TASK`) или `"mr"` (диапазон `BASE..MR_HEAD` на ref MR).
-    Остальные поля одинаковы по форме для обоих источников и потребляются
-    дальнейшими шагами без изменения.
-    """
-    task: str
-    ref: str
-    target: str
-    base: str
-    commits: list[Commit]
-    task_shas: set[str]
-    source_kind: str  # "task" | "mr"
-    mr_id: int | None = None
-    mr_ref: str | None = None
-    review_dir_name: str | None = None
-
-    def comparison_source(self, repository: Path) -> ComparisonSource:
-        """Adapt the same resolved TASK/MR commits used by AI material."""
-        base = self.base
-        if self.source_kind == "task" and base == self.commits[-1].sha:
-            base = None
-        return ComparisonSource(repository, base, self.target, frozenset(self.task_shas))
 
 
 @dataclass(frozen=True)
@@ -318,13 +278,6 @@ class InitGroup:
     @property
     def repo(self) -> Path:
         return self.repositories[0]
-
-
-@dataclass(frozen=True)
-class RepositoryContext:
-    requested_path: Path
-    root: Path
-    ref: str
 
 
 @dataclass
@@ -354,445 +307,6 @@ class PreparedReview:
     source_kind: str
     mr_id: int | None
     mr_ref: str | None
-
-
-@dataclass(frozen=True)
-class MrRefCandidate:
-    mr_id: int
-    mr_ref: str
-
-
-@dataclass(frozen=True)
-class LocalReviewBranch:
-    name: str
-    ref: str
-
-
-@dataclass(frozen=True)
-class BranchUpstream:
-    remote: str
-    merge_ref: str
-
-    @property
-    def remote_branch(self) -> str:
-        prefix = "refs/heads/"
-        if self.merge_ref.startswith(prefix):
-            return self.merge_ref[len(prefix):]
-        return self.merge_ref
-
-    @property
-    def short_ref(self) -> str:
-        return f"{self.remote}/{self.remote_branch}"
-
-    @property
-    def tracking_ref(self) -> str:
-        return f"refs/remotes/{self.remote}/{self.remote_branch}"
-
-
-@dataclass
-class MrRefResolution:
-    mr_id: int
-    mr_ref: str
-    target: str
-    base: str
-    commits: list[Commit]
-    task_shas: set[str]
-
-
-def local_review_branch(ref: str) -> LocalReviewBranch | None:
-    """Вернуть локальную ветку, если выбранный review ref указывает на refs/heads/*."""
-    result = git_result(["rev-parse", "--verify", "--quiet", "--symbolic-full-name", ref])
-    if result.returncode != 0:
-        return None
-    full_ref = result.stdout.decode("utf-8", errors="replace").strip()
-    if not full_ref.startswith("refs/heads/"):
-        return None
-    return LocalReviewBranch(
-        name=full_ref.removeprefix("refs/heads/"),
-        ref=full_ref,
-    )
-
-
-def branch_upstream(branch: LocalReviewBranch) -> BranchUpstream | None:
-    remote_result = git_result(["config", "--get", f"branch.{branch.name}.remote"])
-    merge_result = git_result(["config", "--get", f"branch.{branch.name}.merge"])
-    if remote_result.returncode != 0 or merge_result.returncode != 0:
-        return None
-    remote = remote_result.stdout.decode("utf-8", errors="replace").strip()
-    merge_ref = merge_result.stdout.decode("utf-8", errors="replace").strip()
-    if not remote or not merge_ref:
-        return None
-    return BranchUpstream(remote=remote, merge_ref=merge_ref)
-
-
-def current_local_branch_ref() -> str | None:
-    result = git_result(["symbolic-ref", "-q", "HEAD"])
-    if result.returncode != 0:
-        return None
-    ref = result.stdout.decode("utf-8", errors="replace").strip()
-    return ref or None
-
-
-def rev_parse_sha(ref: str) -> str:
-    return git_text(["rev-parse", "--verify", ref]).strip()
-
-
-def ensure_fast_forward_possible(branch: LocalReviewBranch, upstream: BranchUpstream) -> tuple[str, str]:
-    try:
-        local_sha = rev_parse_sha(branch.ref)
-        upstream_sha = rev_parse_sha(upstream.tracking_ref)
-    except ToolError as exc:
-        raise ToolError(
-            f"Не удалось актуализировать локальную ветку '{branch.name}' "
-            f"от '{upstream.short_ref}': upstream-ref недоступен.\n{exc}",
-            EXIT_USAGE,
-        ) from exc
-
-    if local_sha == upstream_sha:
-        return local_sha, upstream_sha
-
-    ancestor_result = git_result(["merge-base", "--is-ancestor", local_sha, upstream_sha])
-    if ancestor_result.returncode != 0:
-        raise ToolError(
-            f"Локальную ветку '{branch.name}' нельзя безопасно fast-forward'ить "
-            f"до '{upstream.short_ref}'. Выполните ручную синхронизацию ветки.",
-            EXIT_USAGE,
-        )
-    return local_sha, upstream_sha
-
-
-def fast_forward_local_branch(branch: LocalReviewBranch, upstream: BranchUpstream) -> None:
-    current_ref = current_local_branch_ref()
-    if current_ref == branch.ref:
-        result = git_result(["merge", "--ff-only", upstream.tracking_ref])
-    else:
-        result = git_result(["branch", "-f", branch.name, upstream.tracking_ref])
-
-    if result.returncode != 0:
-        stderr = decode_process_stderr(result)
-        details = f"\n{stderr}" if stderr else ""
-        raise ToolError(
-            f"Не удалось безопасно актуализировать ветку '{branch.name}' "
-            f"до '{upstream.short_ref}'.{details}",
-            EXIT_USAGE,
-        )
-
-
-def refresh_local_review_branch(
-    branch: LocalReviewBranch | None,
-    remote: str,
-    fetch_result: subprocess.CompletedProcess,
-) -> None:
-    """Fast-forward выбранную локальную review-ветку после общего fetch."""
-    if branch is None:
-        return
-
-    if fetch_result.returncode != 0:
-        stderr = decode_process_stderr(fetch_result)
-        details = f"\n{stderr}" if stderr else ""
-        raise ToolError(
-            f"Не удалось актуализировать локальную ветку '{branch.name}' "
-            f"с remote '{remote}'.{details}",
-            EXIT_USAGE,
-        )
-
-    upstream = branch_upstream(branch)
-    if upstream is None:
-        raise ToolError(
-            f"У локальной ветки '{branch.name}' не настроен upstream для remote '{remote}'.",
-            EXIT_USAGE,
-        )
-    if upstream.remote != remote:
-        raise ToolError(
-            f"Upstream локальной ветки '{branch.name}' указывает на remote "
-            f"'{upstream.remote}', ожидался '{remote}'.",
-            EXIT_USAGE,
-        )
-
-    local_sha, upstream_sha = ensure_fast_forward_possible(branch, upstream)
-    if local_sha == upstream_sha:
-        print(f"Локальная ветка '{branch.name}' актуальна относительно '{upstream.short_ref}'")
-        return
-
-    fast_forward_local_branch(branch, upstream)
-    print(f"Локальная ветка '{branch.name}' обновлена до '{upstream.short_ref}'")
-
-
-def find_commits_for_tasks(ref: str, tasks: list[str]) -> list[Commit]:
-    if not tasks:
-        return []
-    args = ["log", ref]
-    for task in tasks:
-        args.extend(["--grep", task])
-    args.extend([
-        "--fixed-strings", "--regexp-ignore-case",
-        f"--format={LOG_RECORD_FORMAT}",
-    ])
-    out = git_text(args)
-    return _parse_log_records(out)
-
-
-def find_commits(ref: str, task: str) -> list[Commit]:
-    return find_commits_for_tasks(ref, [task])
-
-
-def fetch_mr_ref(remote: str, mr_id: int) -> str:
-    """Force-fetch GitLab MR-ref в локальный tracking-ref и вернуть его имя.
-
-    Выполняет `git fetch <remote> +refs/merge-requests/<ID>/head:refs/remotes/<remote>/mr/<ID>`
-    с `check=True`. Префикс `+` гарантирует force-update при rebase MR на удалённой
-    стороне. Refspec передаётся одноразово в командной строке — `.git/config` не
-    модифицируется.
-
-    При ошибке fetch (нет сети, MR отсутствует, нет прав) поднимается
-    `ToolError` с русским сообщением и stderr git; вызывающий код возвращает
-    `EXIT_USAGE`.
-    """
-    refspec = f"+refs/merge-requests/{mr_id}/head:refs/remotes/{remote}/mr/{mr_id}"
-    try:
-        run_git(["fetch", remote, refspec], check=True)
-    except ToolError as exc:
-        raise ToolError(
-            f"Не удалось получить ref MR {mr_id} с remote {remote}.\n{exc}",
-            EXIT_USAGE,
-        ) from exc
-    return f"refs/remotes/{remote}/mr/{mr_id}"
-
-
-def fetch_mr_discovery_refs(remote: str) -> None:
-    """Force-fetch all GitLab MR heads into refs/remotes/<remote>/merge-requests/*."""
-    refspec = f"+refs/merge-requests/*/head:refs/remotes/{remote}/merge-requests/*"
-    try:
-        run_git(["fetch", remote, refspec], check=True)
-    except ToolError as exc:
-        raise ToolError(
-            f"Не удалось получить список MR refs с remote {remote}.\n{exc}",
-            EXIT_USAGE,
-        ) from exc
-
-
-def list_mr_discovery_refs(remote: str) -> list[MrRefCandidate]:
-    """Return locally available refs/remotes/<remote>/merge-requests/<ID> refs."""
-    prefix = f"refs/remotes/{remote}/merge-requests"
-    out = git_text(["for-each-ref", "--format=%(refname)", prefix])
-    candidates: list[MrRefCandidate] = []
-    for raw_ref in out.splitlines():
-        mr_ref = raw_ref.strip()
-        if not mr_ref:
-            continue
-        match = re.search(r"/merge-requests/(\d+)$", mr_ref)
-        if not match:
-            continue
-        candidates.append(MrRefCandidate(mr_id=int(match.group(1)), mr_ref=mr_ref))
-    return sorted(candidates, key=lambda item: item.mr_id)
-
-
-# На Windows CreateProcess не допускает NUL в аргументах, поэтому в качестве
-# разделителей полей/записей `git log --format` используем ASCII-управляющие
-# 0x1f/0x1e. Единый литерал для всех источников коммитов (task и MR).
-LOG_SEP_FIELD = "\x1f"
-LOG_SEP_COMMIT = "\x1e"
-LOG_RECORD_FORMAT = f"%H{LOG_SEP_FIELD}%cs{LOG_SEP_FIELD}%s{LOG_SEP_FIELD}%B{LOG_SEP_COMMIT}"
-
-
-def _parse_log_records(out: str) -> list[Commit]:
-    """Разобрать `git log --format=...` с разделителями 0x1f / 0x1e."""
-    commits: list[Commit] = []
-    for raw in out.split(LOG_SEP_COMMIT):
-        raw = raw.strip("\n")
-        if not raw:
-            continue
-        parts = raw.split(LOG_SEP_FIELD, 3)
-        if len(parts) != 4:
-            continue
-        sha, date, subject, body = parts
-        commits.append(Commit(sha=sha, date=date, subject=subject, body=body))
-    return commits
-
-
-def resolve_task_source(
-    ref: str,
-    task: str,
-    *,
-    candidate_commits: list[Commit] | None = None,
-) -> SourceResolution:
-    """Стратегия источника `task`: коммиты по `git log --grep TASK`.
-
-    Полностью повторяет текущее поведение task-режима: target = newest,
-    base = `resolve_merge_base(oldest, ref)`. Пустой список коммитов возвращается
-    как есть; `EXIT_NO_COMMITS` обрабатывается выше по стеку.
-
-    `git log --grep` — грубый префильтр; точный отбор выполняет
-    `filter_commits_for_task` с граничной семантикой ключа (D2), единой с
-    выбором MR-кандидатов: `PROSV-50` не матчит `PROSV-503`.
-    """
-    candidates = find_commits(ref, task) if candidate_commits is None else candidate_commits
-    commits = filter_commits_for_task(candidates, task)
-    if commits:
-        target = commits[0].sha
-        base = resolve_merge_base(commits[-1].sha, ref)
-    else:
-        target = ""
-        base = ""
-    task_shas = {c.sha.lower() for c in commits}
-    return SourceResolution(
-        task=task,
-        ref=ref,
-        target=target,
-        base=base,
-        commits=commits,
-        task_shas=task_shas,
-        source_kind="task",
-        mr_id=None,
-        mr_ref=None,
-    )
-
-
-def resolve_mr_ref_source(ref: str, mr_ref: str, mr_id: int) -> MrRefResolution:
-    """Resolve already fetched MR ref into BASE..MR_HEAD commit data.
-
-    Шаги:
-    1. `MR_HEAD = git rev-parse <mr_ref>`;
-    2. `BASE = git merge-base <REF> <MR_HEAD>`; при отсутствии merge-base —
-       `ToolError(EXIT_NO_COMMITS)` с отдельным сообщением «MR не имеет общей
-       истории с REF» (D4), без тихого фолбэка `BASE=MR_HEAD`;
-    3. `commits = git log --format=<HE_FMT> <BASE>..<MR_HEAD>` с теми же
-       ASCII-разделителями (0x1f/0x1e), что и в task-режиме.
-    """
-    try:
-        mr_head = git_text(["rev-parse", mr_ref]).strip()
-    except ToolError as exc:
-        raise ToolError(
-            f"Локальный ref {mr_ref} недоступен после fetch.\n{exc}",
-            EXIT_NO_COMMITS,
-        ) from exc
-    if not mr_head:
-        raise ToolError(
-            f"Локальный ref {mr_ref} не вернул SHA после fetch.",
-            EXIT_NO_COMMITS,
-        )
-
-    base_proc = git_result(["merge-base", ref, mr_head])
-    base = base_proc.stdout.decode("utf-8", errors="replace").strip() if base_proc.returncode == 0 else ""
-    if not base:
-        # Нет merge-base между REF и MR_HEAD — это отдельная диагностика (D4),
-        # а не тихий фолбэк BASE=MR_HEAD и ложный «пустой набор коммитов».
-        raise ToolError(
-            f"MR {mr_id} не имеет общей истории с {ref}. Проверьте базовый ref "
-            f"(-b/--branch) или соответствие MR базовой ветке.",
-            EXIT_NO_COMMITS,
-        )
-
-    out = git_text(["log", f"{base}..{mr_head}", f"--format={LOG_RECORD_FORMAT}"])
-    commits = _parse_log_records(out)
-    task_shas = {c.sha.lower() for c in commits}
-    return MrRefResolution(
-        mr_id=mr_id,
-        mr_ref=mr_ref,
-        target=mr_head,
-        base=base,
-        commits=commits,
-        task_shas=task_shas,
-    )
-
-
-def mr_resolution_to_source(
-    resolution: MrRefResolution,
-    ref: str,
-    task: str,
-    *,
-    review_dir_name: str | None = None,
-) -> SourceResolution:
-    # Состав коммитов MR-источника — полный диапазон BASE..MR_HEAD (D11); ключ
-    # задачи не сужает набор (правило «один MR = одна задача»). Предикат
-    # `commit_matches_task` остаётся только в `mr_matches_task` — выборе
-    # MR-кандидатов в discovery.
-    return SourceResolution(
-        task=task,
-        ref=ref,
-        target=resolution.target,
-        base=resolution.base,
-        commits=resolution.commits,
-        task_shas=resolution.task_shas,
-        source_kind="mr",
-        mr_id=resolution.mr_id,
-        mr_ref=resolution.mr_ref,
-        review_dir_name=review_dir_name,
-    )
-
-
-def resolve_mr_source(remote: str, ref: str, task: str, mr_id: int) -> SourceResolution:
-    """Стратегия explicit `mr`: коммиты диапазона `BASE..MR_HEAD`.
-
-    Никаких HTTP-вызовов и токенов GitLab не используется.
-    """
-    mr_ref = fetch_mr_ref(remote, mr_id)
-    resolution = resolve_mr_ref_source(ref, mr_ref, mr_id)
-    return mr_resolution_to_source(resolution, ref, task)
-
-
-def task_key_pattern(task: str) -> re.Pattern[str]:
-    return re.compile(
-        rf"(?<![A-Za-z0-9]){re.escape(task)}(?![A-Za-z0-9])",
-        re.IGNORECASE,
-    )
-
-
-def commit_matches_task(commit: Commit, task: str) -> bool:
-    pattern = task_key_pattern(task)
-    return bool(pattern.search(commit.subject) or pattern.search(commit.body))
-
-
-def filter_commits_for_task(commits: list[Commit], task: str) -> list[Commit]:
-    return [commit for commit in commits if commit_matches_task(commit, task)]
-
-
-def mr_matches_task(resolution: MrRefResolution, task: str) -> bool:
-    return any(commit_matches_task(commit, task) for commit in resolution.commits)
-
-
-def resolve_mr_sources_from_tasks(
-    remote: str,
-    ref: str,
-    tasks: list[str],
-) -> tuple[list[SourceResolution], list[str]]:
-    """Find all MR refs matching tasks and return sources ordered by task, then MR ID."""
-    fetch_mr_discovery_refs(remote)
-    candidates = list_mr_discovery_refs(remote)
-
-    resolved: list[MrRefResolution] = []
-    for candidate in candidates:
-        try:
-            resolved.append(resolve_mr_ref_source(ref, candidate.mr_ref, candidate.mr_id))
-        except ToolError:
-            # MR без общей истории с базовым ref (или недоступный локальный ref) не
-            # может относиться к запрошенной задаче — пропускаем кандидата, не
-            # прерывая discovery остальных MR (D4).
-            continue
-
-    matches_by_task: dict[str, list[MrRefResolution]] = {task: [] for task in tasks}
-    for resolution in resolved:
-        for task in tasks:
-            if mr_matches_task(resolution, task):
-                matches_by_task[task].append(resolution)
-
-    sources: list[SourceResolution] = []
-    missing: list[str] = []
-    for task in tasks:
-        matches = sorted(matches_by_task[task], key=lambda item: item.mr_id)
-        if not matches:
-            missing.append(task)
-            continue
-        for resolution in matches:
-            sources.append(
-                mr_resolution_to_source(
-                    resolution,
-                    ref,
-                    task,
-                    review_dir_name=f"{sanitize_task(task)}__mr-{resolution.mr_id}",
-                )
-            )
-    return sources, missing
 
 
 def collect_changed_paths(shas: list[str]) -> list[str]:
@@ -1970,10 +1484,6 @@ def render_stage_prompt_template(
     values = dict(common)
     if "{{FOCUS_AREAS_LIST}}" in template:
         values["FOCUS_AREAS_LIST"] = render_focus_areas_list()
-    if "{{SGR_RESPONSE_SKELETON_BODY}}" in template:
-        values["SGR_RESPONSE_SKELETON_BODY"] = render_sgr_response_skeleton_body()
-    if "{{FIELD_CONSTRAINTS_NOTE}}" in template:
-        values["FIELD_CONSTRAINTS_NOTE"] = render_field_constraints_note()
     return render(template, **values)
 
 
@@ -2023,27 +1533,6 @@ def generate_meta(review_dir: Path, task: str, ref: str, target: str,
     meta = "\n".join(lines) + "\n"
     write_text_lf(review_dir / "_review_info" / "meta.txt", meta)
 
-
-def resolve_merge_base(first_commit: str, ref: str) -> str:
-    parent = f"{first_commit}^"
-    # Фолбэк, если у коммита нет родителя (root commit).
-    if not git_ok(["rev-parse", "--verify", "--quiet", parent]):
-        parent = first_commit
-    result = git_result(["merge-base", parent, ref])
-    if result.returncode == 0:
-        base = result.stdout.decode("utf-8", errors="replace").strip()
-        if base:
-            return base
-    # merge-base не вычислился — применяем фолбэк (родитель старейшего коммита
-    # задачи, либо сам коммит для root). Делаем фолбэк видимым (D4): значение базы
-    # не меняем, но печатаем предупреждение с фактически применённой базой (SHA).
-    resolved = git_result(["rev-parse", "--verify", parent])
-    applied = resolved.stdout.decode("utf-8", errors="replace").strip() if resolved.returncode == 0 else parent
-    _eprint(
-        f"Предупреждение: git merge-base для '{parent}' и '{ref}' не вычислен; "
-        f"применена база {applied}."
-    )
-    return parent
 
 def copy_template_tree(review_dir: Path, dirname: str) -> None:
     """Копирует package runtime/task/<dirname>/ в <TASK>/<dirname>/ (LF, без BOM)."""
@@ -2199,7 +1688,13 @@ def build_init_parser() -> argparse.ArgumentParser:
         help="Записать versioned machine-readable результат init в JSON-файл.",
     )
     parser.add_argument(
-        "--result-schema-version", type=int, choices=(1, 2), default=None,
+        "--after-commit", nargs=2, action="append", default=None, metavar=("REPO_PATH", "SHA"),
+        help="Проверить коммиты после указанного полного SHA в настроенном репозитории; граница исключается.",
+    )
+    parser.add_argument('--source-identity', default=None, metavar='JSON',
+                        help='Service-owned identity выбранного explicit MR.')
+    parser.add_argument(
+        "--result-schema-version", type=int, choices=(1, 2, 3), default=None,
         help="Версия JSON-результата init (по умолчанию 1; версия 2 включает сравнение файлов).",
     )
     parser.add_argument(
@@ -2615,11 +2110,28 @@ def run_for_collected_sources(
     user_instruction: str | None = None,
     result_recorder: InitResultRecorder | None = None,
     comparison_sources: list[ComparisonSource] | None = None,
+    commit_selection: dict | None = None,
+    context_repositories: list[tuple[Path, str]] | None = None,
 ) -> tuple[int, PreparedReview | None]:
     safe_task = review_dir_name or sanitize_task(task)
     kebab_task = task_to_kebab(task)
     review_dir = reviews_root / safe_task
+
+    def history_failure(exc: Exception) -> tuple[int, None]:
+        message = f"Не удалось сохранить историю отчётов: {exc}"
+        _eprint(message, task=task, batch=batch_mode)
+        if result_recorder is not None:
+            result_recorder.outcome = "failure"
+            result_recorder.code = "report_archive_failed"
+            result_recorder.message = message
+            result_recorder.record_review_dir(review_dir.resolve())
+        return EXIT_USAGE, None
+
     with task_lock(review_dir):
+        try:
+            restore_report_history(review_dir)
+        except Exception as exc:
+            return history_failure(exc)
         if not force:
             meta_file = review_dir / "_review_info" / "meta.txt"
             if meta_file.exists() and has_completed_result_status(read_text_safe(meta_file)):
@@ -2653,7 +2165,25 @@ def run_for_collected_sources(
             )
             return EXIT_USAGE, None
 
-        reset_review_dir(review_dir)
+        try:
+            material_targets = {item.repo_root: item.source.target for item in collected}
+            context_sources = prepare_sources(
+                context_repositories if context_repositories is not None else list(material_targets.items()),
+                material_targets,
+            ) if collected else []
+        except (ToolError, OSError) as exc:
+            _eprint(str(exc), task=task, batch=batch_mode)
+            return EXIT_USAGE, None
+
+        try:
+            archive_report(review_dir, f"review-report-{kebab_task}.md")
+            with preserve_report_history(review_dir):
+                reset_review_dir(review_dir)
+        except Exception as exc:
+            return history_failure(exc)
+        if commit_selection is not None and commit_selection['mode'] == 'after':
+            selection_path = review_dir / '_review_info' / 'commit_selection.json'
+            write_text_lf(selection_path, json.dumps(commit_selection, ensure_ascii=False, indent=2) + '\n')
         prepared = None
         if collected:
             source0 = collected[0].source
@@ -2701,6 +2231,7 @@ def run_for_collected_sources(
                 [obj for item in collected for obj in item.object_metadata],
             )
             write_review_source_links(review_dir, collected)
+            write_sources(review_dir, context_sources)
 
             generate_meta(
                 review_dir,
@@ -2721,7 +2252,11 @@ def run_for_collected_sources(
                 write_reference_catalog(review_dir)
             except ReferenceCatalogError as exc:
                 _eprint(str(exc), task=task, batch=batch_mode)
-                reset_review_dir(review_dir)
+                try:
+                    with preserve_report_history(review_dir):
+                        reset_review_dir(review_dir)
+                except Exception as history_exc:
+                    return history_failure(history_exc)
                 return EXIT_USAGE, None
             copy_platform_database_indexes(review_dir)
             generate_task_agents(review_dir, task=task, kebab_task=kebab_task)
@@ -2864,6 +2399,23 @@ def _resolve_init_groups(
 
 
 def _validate_init_args(args: argparse.Namespace, task_count: int) -> int | None:
+    if args.source_identity is not None:
+        try:
+            args.source_identity = validate_source_identity(json.loads(args.source_identity), args.mr)
+        except (ValueError, TypeError) as exc:
+            print(str(exc), file=sys.stderr)
+            return EXIT_USAGE
+    if args.after_commit is not None:
+        if task_count != 1 or args.mr_from_tasks:
+            print('--after-commit поддерживает только одну задачу или explicit MR.', file=sys.stderr)
+            return EXIT_USAGE
+        try:
+            args.after_boundaries = normalize_after_commits(args.after_commit, Path.cwd())
+        except (ValueError, OSError) as exc:
+            print(str(exc), file=sys.stderr)
+            return EXIT_USAGE
+    else:
+        args.after_boundaries = {}
     if args.result_schema_version is not None and args.result_path is None:
         print("Флаг --result-schema-version требует --result-path.", file=sys.stderr)
         return EXIT_USAGE
@@ -2893,46 +2445,6 @@ def _validate_init_args(args: argparse.Namespace, task_count: int) -> int | None
     return None
 
 
-def _resolve_repo_root(repo: Path) -> Path:
-    repo_root_str = git_text(["rev-parse", "--show-toplevel"], cwd=repo).strip()
-    return Path(repo_root_str)
-
-
-def _fetch_and_resolve_repository(
-    repo_root: Path, ref_arg: str, remote: str, *, branch_explicit: bool
-) -> str:
-    os.chdir(repo_root)
-    branch_to_refresh = local_review_branch(ref_arg)
-    sync_result = git_result(["fetch", remote, "--prune"])
-    if sync_result.returncode != 0:
-        stderr = decode_process_stderr(sync_result)
-        details = f"\n{stderr}" if stderr else ""
-        raise ToolError(f"Не удалось синхронизировать репозиторий с remote '{remote}'.{details}", EXIT_USAGE)
-    print(f"Синхронизация с remote '{remote}': ok")
-    refresh_local_review_branch(branch_to_refresh, remote, sync_result)
-    return resolve_target_ref(ref_arg, remote, branch_explicit=branch_explicit)
-
-
-def resolve_target_ref(ref: str, remote: str, *, branch_explicit: bool) -> str:
-    """Резолв target-ref с учётом явности (D1).
-
-    Явно заданный ref (`-b` или prefix-config `branch`), не резолвящийся после
-    синхронизации, — ошибка кода 1 без подмены другим ref. Фолбэк-цепочка
-    `origin/master → origin/main → master → main → HEAD` применяется только для
-    встроенного умолчания (`branch_explicit=False`).
-    """
-    if branch_explicit:
-        if git_ok(["rev-parse", "--verify", "--quiet", ref]):
-            return ref
-        raise ToolError(
-            f"Явно заданный ref '{ref}' не найден после синхронизации с remote "
-            f"'{remote}'. Проверьте значение -b/--branch или ветку в prefix-config; "
-            f"фолбэк на origin/master для явного ref не применяется.",
-            EXIT_USAGE,
-        )
-    return resolve_ref(ref)
-
-
 def _run_task_sources_across_repositories(
     group: InitGroup,
     contexts: list[RepositoryContext],
@@ -2943,6 +2455,7 @@ def _run_task_sources_across_repositories(
     force: bool,
     user_instruction: str | None,
     result_recorder: InitResultRecorder | None = None,
+    boundaries: dict[str, str] | None = None,
 ) -> tuple[int, tuple[PreparedReview, ...]]:
     first_nonzero = EXIT_OK
     prepared_reviews: list[PreparedReview] = []
@@ -2952,8 +2465,7 @@ def _run_task_sources_across_repositories(
         if key in candidates_by_repository:
             continue
         try:
-            os.chdir(context.root)
-            candidates_by_repository[key] = find_commits_for_tasks(context.ref, group.tasks)
+            candidates_by_repository[key] = find_commits_for_tasks(context.ref, group.tasks, cwd=context.root)
         except ToolError as exc:
             candidates_by_repository[key] = exc
 
@@ -2961,17 +2473,37 @@ def _run_task_sources_across_repositories(
         collected: list[CollectedSource] = []
         comparison_sources: list[ComparisonSource] = []
         errors: list[tuple[int, str]] = []
+        records: list[tuple[RepositoryContext, SourceResolution]] = []
+        for context in contexts:
+            candidates = candidates_by_repository[(context.root, context.ref)]
+            if isinstance(candidates, ToolError):
+                if boundaries:
+                    raise candidates
+                continue
+            records.append((context, resolve_task_source(
+                context.ref, task, candidate_commits=candidates, cwd=context.root,
+            )))
+        if boundaries:
+            records = restrict_sources(records, boundaries)
+            if not any(source.commits for _, source in records):
+                if result_recorder is not None:
+                    result_recorder.outcome = 'failure'
+                    result_recorder.code = 'no_new_commits'
+                    result_recorder.message = 'После выбранной границы нет новых коммитов.'
+                return EXIT_USAGE, ()
+        selection = build_commit_selection(task, records, boundaries or {}) if records else None
+        if result_recorder is not None:
+            result_recorder.commit_selection = selection
+        source_by_root = {context.root: source for context, source in records}
         for context in contexts:
             try:
                 os.chdir(context.root)
                 candidates = candidates_by_repository[(context.root, context.ref)]
                 if isinstance(candidates, ToolError):
                     raise candidates
-                source = resolve_task_source(
-                    context.ref,
-                    task,
-                    candidate_commits=candidates,
-                )
+                source = source_by_root[context.root]
+                if boundaries and not source.commits:
+                    continue
                 if source.commits:
                     comparison_sources.append(source.comparison_source(context.root))
                 item, code, message = collect_source_prompt_data(
@@ -3003,6 +2535,8 @@ def _run_task_sources_across_repositories(
             user_instruction=user_instruction,
             result_recorder=result_recorder,
             comparison_sources=comparison_sources,
+            commit_selection=selection,
+            context_repositories=[(context.root, context.ref) for context in contexts],
         )
         if code == EXIT_OK and prepared is not None:
             prepared_reviews.append(prepared)
@@ -3024,12 +2558,12 @@ def _run_mr_sources_single_repository(
     sources: list[SourceResolution] = []
     missing_mr_tasks: list[str] = []
     if args.mr is not None:
-        source = resolve_mr_source(group.remote, context.ref, group.tasks[0], args.mr)
+        source = resolve_mr_source(group.remote, context.ref, group.tasks[0], args.mr, cwd=context.root)
         if args.review_dir_name is not None:
             source.review_dir_name = args.review_dir_name
         sources.append(source)
     elif args.mr_from_tasks:
-        sources, missing_mr_tasks = resolve_mr_sources_from_tasks(group.remote, context.ref, group.tasks)
+        sources, missing_mr_tasks = resolve_mr_sources_from_tasks(group.remote, context.ref, group.tasks, cwd=context.root)
     else:
         return EXIT_OK, ()
 
@@ -3040,6 +2574,18 @@ def _run_mr_sources_single_repository(
         _eprint(f"MR для задачи '{task}' не найдены.", task=task, batch=batch_mode)
 
     for source in sources:
+        records = restrict_sources([(context, source)], args.after_boundaries) if args.after_boundaries else [(context, source)]
+        source = records[0][1]
+        if args.after_boundaries and not source.commits:
+            if result_recorder is not None:
+                result_recorder.outcome = 'failure'
+                result_recorder.code = 'no_new_commits'
+                result_recorder.message = 'После выбранной границы нет новых коммитов.'
+            return EXIT_USAGE, ()
+        selection = build_commit_selection(source.task, records, args.after_boundaries,
+                                           source_identity=args.source_identity, remote=group.remote)
+        if result_recorder is not None:
+            result_recorder.commit_selection = selection
         item, code, message = collect_source_prompt_data(
             source,
             context.root,
@@ -3062,6 +2608,8 @@ def _run_mr_sources_single_repository(
             user_instruction=args.user_instruction,
             result_recorder=result_recorder,
             comparison_sources=[source.comparison_source(context.root)] if source.commits else [],
+            commit_selection=selection,
+            context_repositories=[(context.root, context.ref)],
         )
         if code == EXIT_OK and prepared is not None:
             prepared_reviews.append(prepared)
@@ -3091,6 +2639,17 @@ def _run_init_group(
                 print(f"Путь '{repo}' не является git-репозиторием.", file=sys.stderr)
                 return EXIT_USAGE
             contexts.append(RepositoryContext(requested_path=repo, root=repo_root, ref=""))
+
+        aliases = {normalize_repository_path(path): normalize_repository_path(context.root)
+                   for context in contexts for path in (context.requested_path, context.root)}
+        if set(args.after_boundaries) - set(aliases):
+            print('Граница указывает на репозиторий вне настроенного source.', file=sys.stderr)
+            return EXIT_USAGE
+        bound_roots = [aliases[path] for path in args.after_boundaries]
+        if len(set(bound_roots)) != len(bound_roots):
+            print('Повтор границы для одного Git-репозитория.', file=sys.stderr)
+            return EXIT_USAGE
+        args.after_boundaries = {aliases[path]: sha for path, sha in args.after_boundaries.items()}
 
         try:
             effective_config = load_effective_config(contexts[0].root, config_path)
@@ -3148,16 +2707,21 @@ def _run_init_group(
                 print(str(exc), file=sys.stderr)
                 return exc.exit_code
         else:
-            first_nonzero, prepared_reviews = _run_task_sources_across_repositories(
-                group,
-                resolved_contexts,
-                config=effective_config,
-                counter=counter,
-                batch_mode=len(group.tasks) > 1,
-                force=args.force,
-                user_instruction=args.user_instruction,
-                result_recorder=result_recorder,
-            )
+            try:
+                first_nonzero, prepared_reviews = _run_task_sources_across_repositories(
+                    group,
+                    resolved_contexts,
+                    config=effective_config,
+                    counter=counter,
+                    batch_mode=len(group.tasks) > 1,
+                    force=args.force,
+                    user_instruction=args.user_instruction,
+                    result_recorder=result_recorder,
+                    boundaries=args.after_boundaries,
+                )
+            except ToolError as exc:
+                print(str(exc), file=sys.stderr)
+                return exc.exit_code
 
         if prepared_reviews:
             try:
@@ -3413,32 +2977,68 @@ def run_read_meta_summary(argv: list[str]) -> int:
     return EXIT_OK
 
 
-def run_read_feedback(argv: list[str]) -> int:
-    from .review_result import FeedbackReadError, read_task_feedback
-
+def _memory_command_parser(command: str, description: str) -> argparse.ArgumentParser:
     # Captured Windows streams otherwise use the legacy system encoding.
     for stream in (sys.stdout, sys.stderr):
         if isinstance(stream, TextIOWrapper):
             stream.reconfigure(encoding="utf-8", newline="\n")
 
-    parser = _task_command_parser(
-        "read-feedback",
-        "Вывести все сохранённые отзывы специалиста по задаче одним текстом.",
-    )
+    parser = _task_command_parser(command, description)
     parser.add_argument("--task", required=True, metavar="TASK", help="Ключ задачи.")
+    return parser
+
+
+def run_memory_read(argv: list[str]) -> int:
+    from .review_result import MemoryOperationError, read_task_memory
+
+    parser = _memory_command_parser("memory-read", "Вывести всю память правил задачи в JSON.")
     args, parse_code = parse_args_or_usage(parser, argv)
     if args is None:
         return parse_code if parse_code is not None else EXIT_USAGE
-    task = args.task.strip()
-    if not task:
-        print("Параметр --task не должен быть пустым.", file=sys.stderr)
-        return EXIT_USAGE
     try:
-        text = read_task_feedback(task)
-    except FeedbackReadError as exc:
+        text = read_task_memory(args.task)
+    except MemoryOperationError as exc:
         print(str(exc), file=sys.stderr)
         return EXIT_USAGE
     sys.stdout.write(text)
+    return EXIT_OK
+
+
+def run_memory_add(argv: list[str]) -> int:
+    from .review_result import MemoryOperationError, add_task_memory
+
+    parser = _memory_command_parser(
+        "memory-add", "Сохранить правило обсуждения или заменить существующее правило без истории.",
+    )
+    parser.add_argument("--input", required=True, type=Path, metavar="JSON",
+                        help="UTF-8 JSON с текстом правила для будущих ревью задачи и необязательным контекстом исходного замечания.")
+    parser.add_argument("--replace", metavar="ID", help="ID заменяемой записи; новая получит другой ID.")
+    args, parse_code = parse_args_or_usage(parser, argv)
+    if args is None:
+        return parse_code if parse_code is not None else EXIT_USAGE
+    try:
+        result = add_task_memory(args.task, args.input, replace_id=args.replace)
+    except MemoryOperationError as exc:
+        print(str(exc), file=sys.stderr)
+        return EXIT_USAGE
+    print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
+    return EXIT_OK
+
+
+def run_memory_delete(argv: list[str]) -> int:
+    from .review_result import MemoryOperationError, delete_task_memory
+
+    parser = _memory_command_parser("memory-delete", "Удалить одну запись памяти любого источника по ID.")
+    parser.add_argument("--id", required=True, metavar="ID", help="ID удаляемой записи.")
+    args, parse_code = parse_args_or_usage(parser, argv)
+    if args is None:
+        return parse_code if parse_code is not None else EXIT_USAGE
+    try:
+        result = delete_task_memory(args.task, args.id)
+    except MemoryOperationError as exc:
+        print(str(exc), file=sys.stderr)
+        return EXIT_USAGE
+    print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
     return EXIT_OK
 
 
@@ -3486,6 +3086,12 @@ def _run_stage2(entrypoint: str, argv: list[str]) -> int:
     return getattr(stage2_cli, entrypoint)(argv)
 
 
+def _run_repository_context(command: str, argv: list[str]) -> int:
+    from .repository_context.cli import main
+
+    return main(command, argv)
+
+
 COMMAND_GROUPS = {
     "general": "Общие команды",
     "stage1": "Stage 1",
@@ -3503,8 +3109,13 @@ COMMAND_TABLE: dict[str, CommandSpec] = {
     "check-ready": CommandSpec(run_check_ready, "Проверить готовность текущей task capsule.", "general"),
     "mcp-ready": CommandSpec(run_mcp_ready, "Проверить разрешение MCP в текущей задаче.", "general"),
     "read-meta-summary": CommandSpec(run_read_meta_summary, "Прочитать compact metadata задачи.", "general"),
-    "read-feedback": CommandSpec(run_read_feedback, "Вывести сохранённые отзывы специалиста по задаче.", "general"),
+    "memory-read": CommandSpec(run_memory_read, "Вывести сохранённые правила задачи.", "general"),
+    "memory-add": CommandSpec(run_memory_add, "Добавить или заменить правило задачи.", "general"),
+    "memory-delete": CommandSpec(run_memory_delete, "Удалить правило задачи по ID.", "general"),
     "set-status": CommandSpec(run_set_status, "Записать completion metadata задачи.", "general"),
+    "code-search": CommandSpec(lambda argv: _run_repository_context("code-search", argv), "Найти текст в TARGET подготовленного ревью.", "general"),
+    "file-find": CommandSpec(lambda argv: _run_repository_context("file-find", argv), "Найти путь файла в TARGET подготовленного ревью.", "general"),
+    "file-read": CommandSpec(lambda argv: _run_repository_context("file-read", argv), "Прочитать строки файла в TARGET подготовленного ревью.", "general"),
     "stage1-add-candidate": CommandSpec(lambda argv: _run_stage1("add_main", argv), "Добавить кандидата.", "stage1"),
     "stage1-remove-candidate": CommandSpec(lambda argv: _run_stage1("remove_main", argv), "Удалить кандидата до Stage 2.", "stage1"),
     "stage1-list-candidates": CommandSpec(lambda argv: _run_stage1("list_main", argv), "Вывести кандидатов.", "stage1"),

@@ -1,12 +1,12 @@
 # RDV AIR – AI Review
 
-![1С:Предприятие – BSL](https://img.shields.io/badge/1C%3AEnterprise-BSL-blue.svg) ![Status: active](https://img.shields.io/badge/status-active-success.svg) [![OpenYellow](https://openyellow.openintegrations.dev/data/badges/1386951837.svg)](https://openyellow.org/grid?filter=top&repo=1386951837) ![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue.svg) [![License: BSD 3-Clause](https://img.shields.io/badge/license-BSD_3--Clause-blue.svg)](LICENSE)
+![1С:Предприятие – BSL](https://img.shields.io/badge/1C%3AEnterprise-BSL-blue.svg) ![Status: active](https://img.shields.io/badge/status-active-success.svg) [![OpenYellow](https://openyellow.openintegrations.dev/data/badges/1386951837.svg)](https://openyellow.org/grid?filter=top&repo=1386951837) ![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue.svg) [![License: BSD 3-Clause](https://img.shields.io/badge/license-BSD_3--Clause-blue.svg)](LICENSE) [![Telegram: RDV AIR](https://img.shields.io/badge/Telegram-RDV_AIR-26A5E4.svg?logo=telegram&logoColor=white)](https://t.me/rdv_air)
 
 RDV AIR – ИИ-агент для ревью модулей 1С:Предприятия (1C:Enterprise, BSL) и запросов СКД по номеру задачи или GitLab Merge Request (MR).
 
 [Быстрый старт](#быстрый-старт) · [Как устроено](#устройство-агента-модель-движок-и-yaml-протокол-поведения) · [Запуск из Jira](#запуск-из-jira) · [FAQ](#faq)
 
-![ИИ-ревью кода 1С области проверки](docs/images/0-verification-areas-air.png)
+[![ИИ-ревью кода 1С области проверки](docs/images/0-verification-areas-air.png)](https://t.me/rdv_air)
 
 Форматирование, ширина строк, опечатки и другие правила, которые не требуют анализа контекста, остаются за SonarQube и линтерами.
 

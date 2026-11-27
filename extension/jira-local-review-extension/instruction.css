@@ -14,24 +14,25 @@
 body { margin: 0; }
 
 .instruction-page {
-  width: min(920px, calc(100% - 32px));
-  margin: 48px auto;
+  width: min(960px, calc(100% - 32px));
+  margin: 20px auto;
 }
 
 .page-header {
-  padding: 28px 32px;
+  padding: 16px 24px;
   border-radius: 16px 16px 0 0;
   background: var(--brand-navy);
   color: #fff;
 }
 
 .eyebrow { font-size: 12px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; opacity: .75; }
-h1 { margin: 8px 0 6px; font-size: clamp(26px, 4vw, 38px); }
+h1 { margin: 4px 0; font-size: clamp(22px, 3vw, 28px); }
 h1 span { color: var(--brand-cyan-bright); }
-.page-header p { max-width: 760px; margin: 0; color: #d7f5fb; line-height: 1.5; }
+.page-header p { max-width: 800px; margin: 0; color: #d7f5fb; font-size: 13px; line-height: 1.45; }
 
 .message {
-  padding: 14px 18px;
+  padding: 8px 24px;
+  font-size: 13px;
   border: 1px solid #b8d9e1;
   border-top: 0;
   background: #fff;
@@ -41,12 +42,12 @@ h1 span { color: var(--brand-cyan-bright); }
 .message.success { color: var(--brand-navy); background: #e9faff; border-color: var(--brand-cyan); }
 
 .instruction-form {
-  padding: 28px 32px 32px;
+  padding: 14px 24px 18px;
   border: 1px solid #b8d9e1;
   border-top: 0;
   border-radius: 0 0 16px 16px;
   background: #fff;
-  box-shadow: 0 16px 40px rgba(1, 63, 83, .1);
+  box-shadow: 0 8px 24px rgba(1, 63, 83, .06);
 }
 .instruction-form[hidden] { display: none; }
 
@@ -54,14 +55,15 @@ h1 span { color: var(--brand-cyan-bright); }
 textarea {
   display: block;
   width: 100%;
-  min-height: min(48vh, 420px);
+  height: 140px;
+  min-height: 120px;
   resize: vertical;
   border: 1px solid #9fcbd5;
   border-radius: 10px;
-  padding: 14px 16px;
+  padding: 10px 12px;
   background: #fff;
   color: inherit;
-  font: 16px/1.55 "Cascadia Code", Consolas, monospace;
+  font: 14px/1.5 "Cascadia Code", Consolas, monospace;
   overflow-wrap: break-word;
   white-space: pre-wrap;
 }
@@ -70,9 +72,10 @@ textarea:focus { outline: 3px solid rgba(0, 190, 228, .25); border-color: var(--
 .field-meta {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
-  gap: 16px;
+  gap: 6px 16px;
   align-items: start;
-  margin-top: 8px;
+  margin: 6px 0 12px;
+  font-size: 12px;
   color: var(--brand-blue);
 }
 .field-meta small { line-height: 1.4; }
@@ -105,10 +108,11 @@ button.secondary:hover:not(:disabled) { background: #e9faff; border-color: var(-
 .save-status.loading, .save-status.success { color: var(--brand-blue); }
 .save-status.validation, .save-status.error { color: var(--brand-navy); }
 button {
-  min-width: 124px;
+  min-width: 112px;
+  min-height: 40px;
   border: 1px solid var(--brand-blue);
   border-radius: 8px;
-  padding: 10px 16px;
+  padding: 8px 14px;
   background: var(--brand-blue);
   color: #fff;
   font: inherit;
@@ -125,7 +129,54 @@ button:disabled { cursor: not-allowed; opacity: .6; }
   .instruction-page { width: 100%; margin: 0; }
   .page-header, .instruction-form { border-radius: 0; padding-left: 20px; padding-right: 20px; }
   .field-meta { grid-template-columns: 1fr; gap: 8px; }
-  textarea { min-height: 55vh; }
   .actions button { flex: 1 1 140px; }
   .save-status { flex-basis: 100%; }
+}
+/* Boundary controls share the existing editor page and remain independent. */
+.commit-selection { margin: 16px 0; padding: 18px 24px; border: 1px solid #b8d9e1; border-radius: 12px; background: #fff; }
+.commit-selection h2 { margin: 0 0 6px; font-size: 18px; line-height: 1.4; }
+.commit-selection p { line-height: 1.45; }
+.selection-hint { margin: 0 0 6px; font-size: 13px; }
+.selection-help { margin-bottom: 14px; font-size: 12px; color: #477282; }
+.selection-help p { margin: 8px 0; }
+summary { width: fit-content; cursor: pointer; color: var(--brand-blue); }
+summary:focus-visible { outline: 3px solid rgba(0, 190, 228, .3); outline-offset: 2px; }
+.commit-repository { display: grid; gap: 6px; padding: 10px 0; border-top: 1px solid #e1edf1; min-width: 0; }
+.commit-repository-heading { display: flex; align-items: baseline; flex-wrap: wrap; gap: 6px 12px; min-width: 0; }
+.commit-repository label { overflow-wrap: anywhere; font-size: 13px; font-weight: 700; }
+.commit-repository-path { font-size: 12px; min-width: 0; }
+.commit-repository-path[open] { flex-basis: 100%; order: 1; }
+.commit-repository-path code { display: block; margin-top: 5px; overflow-wrap: anywhere; line-height: 1.45; }
+.commit-repository-empty { margin-left: auto; color: #477282; font-size: 12px; }
+.commit-repository select { width: 100%; min-width: 0; min-height: 38px; padding: 7px 10px; border: 1px solid #9fcbd5; border-radius: 7px; background: #fff; color: inherit; font-family: inherit; font-size: 13px; line-height: 1.4; }
+.commit-detail { display: grid; gap: 4px; padding: 8px 10px; border: 1px solid #d3e8ee; border-radius: 7px; background: #f4fbfd; font-size: 12px; overflow-wrap: anywhere; }
+.commit-detail[hidden] { display: none; }
+.commit-detail.is-missing { background: #fff9dc; border-color: #e6c756; }
+.commit-detail-meta { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.commit-detail-date { color: #477282; font-size: 12px; }
+.commit-count { flex-shrink: 0; padding: 3px 8px; border-radius: 20px; background: #dff5fb; color: var(--brand-navy); font-size: 12px; font-weight: 700; }
+.commit-detail-sha { display: block; font: 12px ui-monospace, SFMono-Regular, Consolas, monospace; user-select: text; color: var(--brand-blue); }
+.commit-detail-subject { min-width: 0; font-size: 13px; font-weight: 600; line-height: 1.4; }
+.commit-more[open] .commit-detail-sha { margin: 6px 0 4px; }
+.commit-detail-hint { color: #477282; font-size: 12px; line-height: 1.5; }
+.commit-selection #commitSelectionStatus { margin: 8px 0 12px; font-size: 12px; }
+.commit-selection .error { color: #ae2634; }
+.commit-repository select:focus-visible { outline: 3px solid rgba(0, 190, 228, .3); outline-offset: 2px; }
+@media (min-width: 621px) and (max-height: 800px) {
+  .instruction-page { margin: 12px auto; }
+  .page-header { padding: 12px 24px; }
+  .instruction-form { padding: 12px 24px 14px; }
+  .message { padding-top: 6px; padding-bottom: 6px; }
+  textarea { height: 120px; }
+  .field-meta { margin-bottom: 8px; }
+  .commit-selection { margin: 12px 0; padding: 14px 24px; }
+  .selection-help { margin-bottom: 8px; }
+  .commit-repository { padding-top: 8px; padding-bottom: 8px; }
+  button { min-height: 38px; }
+}
+@media (max-width: 620px) {
+  .commit-selection { padding-left: 20px; padding-right: 20px; }
+  .message { padding-left: 20px; padding-right: 20px; }
+  .commit-detail-meta { flex-wrap: wrap; }
+  .commit-repository select { min-height: 40px; }
 }

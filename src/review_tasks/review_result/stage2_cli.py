@@ -74,6 +74,11 @@ def finding_main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--question-to-author",
+        help=("вопрос автору по этой находке; при исправлении повтори актуальный текст. "
+              "Отсутствие аргумента удаляет вопрос, сохраняя channels и traces"),
+    )
+    parser.add_argument(
         "--source",
         required=True,
         help=(
@@ -259,22 +264,16 @@ def set_result_main(argv: list[str] | None = None) -> int:
     parser = _RussianParser(
         prog=f"review-tasks {operation}",
         description=(
-            "Атомарно заменить публичные поля Stage 2; отсутствие повторяемого аргумента "
+            "Атомарно заменить missing_context Stage 2; отсутствие повторяемого аргумента "
             "записывает пустой список."
         ),
         allow_abbrev=False,
     )
     parser.add_argument(
-        "--summary",
-        required=True,
-        help="краткий итог ревью в 1–3 предложениях без повтора сохранённых `findings`",
-    )
-    parser.add_argument(
         "--question",
-        dest="questions",
         action="append",
         default=[],
-        help="повторяемый вопрос автору, ответ на который может изменить вывод",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--missing-context",
@@ -284,6 +283,12 @@ def set_result_main(argv: list[str] | None = None) -> int:
     )
 
     def action(args: argparse.Namespace) -> tuple[bool, str | None]:
+        if args.question:
+            raise ReviewYamlError(
+                "`--question` больше не поддерживается. Запишите вопрос через "
+                "`stage2-upsert-finding --question-to-author`."
+            )
+        del args.question
         return set_result(**vars(args)), None
 
     return _run(parser, argv, operation, action)

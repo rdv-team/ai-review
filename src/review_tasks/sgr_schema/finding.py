@@ -143,6 +143,7 @@ class Finding(SgrBaseModel):
     start_line: LineNumber
     end_line: LineNumber
     observation: NonBlankStr
+    question_to_author: NonBlankStr | None = None
     source: FindingSource
     confidence: ConfidenceLevel
     self_check: SelfCheck

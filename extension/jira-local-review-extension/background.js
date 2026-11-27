@@ -1,14 +1,57 @@
 /* global chrome, importScripts */
 if (typeof importScripts === "function") {
-  importScripts("issue.js", "status.js", "api.js");
+  importScripts("issue.js", "status.js", "api.js", "commit-selection-store.js");
 } else if (typeof require !== "undefined") {
   globalThis.RdvIssue = require("./issue.js");
   globalThis.RdvReviewStatus = require("./status.js");
   globalThis.RdvLocalReviewApi = require("./api.js");
+  globalThis.RdvCommitSelection = require("./commit-selection-store.js");
 }
 
 const ACTIVE_ALARM = "rdv-local-review-poll";
 const TRUSTED_STORAGE_ACCESS = "TRUSTED_CONTEXTS";
+let selectionStore;
+let selectionQueue = Promise.resolve();
+
+async function selectionContext(context) {
+  const settings = await getSettings();
+  const api = new globalThis.RdvLocalReviewApi.LocalReviewApi(settings);
+  const response = await api.getPrefixConfig(context.issueKey.split("-", 1)[0]);
+  const config = response.config || {};
+  const init = context.init ? { ...context.init } : null;
+  if (init) delete init.mrTitle;
+  return {
+    issueKey: context.issueKey,
+    mode: context.mode === "mr" ? "mr" : "task",
+    init,
+    config: { repoPath: config.repoPath, branch: config.branch, remote: config.remote },
+    service: { port: settings.port }
+  };
+}
+
+async function executeSelectionCommand(message) {
+  if (!selectionStore) selectionStore = globalThis.RdvCommitSelection.createStore(chrome.storage.session);
+  if (message.command === "issue" || message.command === "consume") return selectionStore(message.command, message);
+  if (message.command === "activate") {
+    return selectionStore("activate", { context: await selectionContext(message.context) });
+  }
+  const draft = await selectionStore(message.command === "current" ? "current" : "read", message);
+  if (!draft) return null;
+  const currentContext = await selectionContext(draft.context);
+  if (globalThis.RdvCommitSelection.identity(currentContext) !== globalThis.RdvCommitSelection.identity(draft.context)) {
+    await selectionStore("activate", { context: currentContext });
+    if (message.command === "current") return selectionStore("current", message);
+    throw new Error("stale_draft");
+  }
+  if (message.command === "current") return draft;
+  return selectionStore(message.command, message);
+}
+
+function handleSelectionCommand(message) {
+  const result = selectionQueue.then(() => executeSelectionCommand(message));
+  selectionQueue = result.catch(() => undefined);
+  return result;
+}
 const ACTION_ICON_PATHS = {
   default: {
     "16": "icons/review-default-16.png",
@@ -68,6 +111,7 @@ function reportStorageAccessFailure(error, logger = console) {
 async function getActiveIssueStatus() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   const parsed = globalThis.RdvIssue.parseIssueFromUrl(tab && tab.url ? tab.url : "");
+  if (parsed.ok) await handleSelectionCommand({ command: "issue", issueKey: parsed.issueKey });
   if (!parsed.ok) {
     return null;
   }
@@ -125,6 +169,16 @@ if (typeof chrome !== "undefined" && chrome.storage && chrome.storage.local) {
 
 if (typeof chrome !== "undefined" && chrome.runtime && chrome.alarms) {
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+    if (message && message.type === "commitSelection") {
+      if (!_sender || typeof _sender.url !== "string" || !_sender.url.startsWith(chrome.runtime.getURL(""))) {
+        sendResponse({ ok: false, error: "untrusted_context" });
+        return false;
+      }
+      handleSelectionCommand(message)
+        .then((draft) => sendResponse({ ok: true, draft }))
+        .catch((error) => sendResponse({ ok: false, error: error.code || error.message || "storage_unavailable" }));
+      return true;
+    }
     if (message && message.type === "jiraContext") {
       saveIssueState(message.context).then(() => sendResponse({ ok: true }));
       return true;

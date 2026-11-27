@@ -1,5 +1,11 @@
 """Review result processing feature."""
 
-from .feedback import FeedbackError, FeedbackReadError, ReviewReportFeature, read_task_feedback
+from .memory import (
+    MemoryOperationError, ReportStateError, ReviewReportFeature,
+    add_task_memory, delete_task_memory, read_task_memory,
+)
+from .discussion import prepare_discussion, validate_discussion_payload
 
-__all__ = ["FeedbackError", "FeedbackReadError", "ReviewReportFeature", "read_task_feedback"]
+__all__ = ["MemoryOperationError", "ReportStateError", "ReviewReportFeature", "read_task_memory",
+           "add_task_memory", "delete_task_memory",
+           "prepare_discussion", "validate_discussion_payload"]

@@ -11,8 +11,9 @@ from typing import Any
 from review_tasks.task_capsule.metadata import read_input_truncated
 from .review_yaml import (
     ReviewYamlError, SEVERITY_TITLES, expand_review_result_inputs,
-    read_review_yaml_documents, published_findings, finding_source_url,
-    _load_source_links_for_documents,
+    read_review_yaml_documents, published_findings, finding_source_url, finding_numbers,
+    _load_source_links_for_documents, ReviewYamlDocument,
+    project_author_questions, report_digest_mapping,
 )
 
 
@@ -35,13 +36,16 @@ def _title(text: str) -> str:
     return text
 
 
-def build_report_snapshot(task_dir: Path, task: str) -> ReportSnapshot:
+def build_report_snapshot(task_dir: Path, task: str, *,
+                          documents: list[ReviewYamlDocument] | None = None) -> ReportSnapshot:
     review_info = task_dir / "_review_info"
     paths = expand_review_result_inputs([review_info])
     if not paths:
         raise ReviewYamlError("Структурированный YAML-результат недоступен.")
-    documents = read_review_yaml_documents(paths)
+    if documents is None:
+        documents = read_review_yaml_documents(paths)
     links = _load_source_links_for_documents(documents)
+    numbers = finding_numbers(documents)
     source_context = {}
     meta = review_info / "meta.txt"
     if meta.exists():
@@ -52,7 +56,7 @@ def build_report_snapshot(task_dir: Path, task: str) -> ReportSnapshot:
     canonical = {
         "task": task, "source": source_context,
         "documents": [{"source": doc.source.relative_to(review_info).as_posix(),
-                       "result": doc.parsed.model_dump(mode="json"),
+                       "result": report_digest_mapping(doc),
                        "links": links[doc.source.parent]} for doc in documents],
     }
 
@@ -60,6 +64,7 @@ def build_report_snapshot(task_dir: Path, task: str) -> ReportSnapshot:
         record = {
             "id": _digest([doc.source.relative_to(review_info).as_posix(), finding.name]),
             "name": finding.name, "title": _title(finding.observation),
+            "number": numbers[(doc.source, finding.name)],
             "file": finding.file, "startLine": finding.start_line, "endLine": finding.end_line,
             "observation": finding.observation,
         }
@@ -72,7 +77,7 @@ def build_report_snapshot(task_dir: Path, task: str) -> ReportSnapshot:
     for severity in SEVERITY_TITLES:
         for doc, finding in published_findings(documents, severity):
             record = entry(doc, finding)
-            record.update(number=len(published) + 1, severity=severity, suggestion=finding.suggestion)
+            record.update(severity=severity, suggestion=finding.suggestion)
             published.append(record)
     rejected = []
     for doc in documents:
@@ -82,9 +87,8 @@ def build_report_snapshot(task_dir: Path, task: str) -> ReportSnapshot:
                 record["dropReason"] = finding.self_check.drop_reason
                 rejected.append(record)
     return ReportSnapshot(_digest(canonical), {
-        "schemaVersion": 1, "published": published, "agentRejected": rejected,
-        "summary": "\n\n".join(doc.parsed.summary for doc in documents),
-        "questionsToAuthor": [item for doc in documents for item in doc.parsed.questions_to_author],
+        "schemaVersion": 2, "published": published, "agentRejected": rejected,
+        "questionsToAuthor": project_author_questions(documents, links),
         "missingContext": [item for doc in documents for item in doc.parsed.missing_context],
         "inputTruncated": read_input_truncated(task_dir),
     })

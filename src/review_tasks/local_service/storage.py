@@ -82,6 +82,8 @@ class JobStore:
                 "warnings": [],
                 "error": None,
                 "cancelRequested": False,
+                "afterCommits": (request.get("init") or {}).get("afterCommits", []),
+                "commitSelection": None,
             }
             write_json(run_dir / "request.json", compact_request_for_storage(request))
             self.write_status(status)

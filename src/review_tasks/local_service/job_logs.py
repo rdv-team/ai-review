@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .problem_details import diagnostic_entry, unique_diagnostics
+from .opencode_log import READABLE_LOG_FILENAME
 from .storage import safe_tail
 
 
@@ -25,6 +26,7 @@ JOB_LOG_SOURCES: tuple[JobLogSource, ...] = (
     JobLogSource("cursor.stdout", "cursor.stdout.log", "Вывод Cursor"),
     JobLogSource("opencode.stderr", "opencode.stderr.log", "Ошибки OpenCode"),
     JobLogSource("opencode.stdout", "opencode.stdout.log", "Вывод OpenCode"),
+    JobLogSource("opencode.agent", READABLE_LOG_FILENAME, "Лог агента OpenCode"),
     JobLogSource("mcp.registry.stderr", "preflight.mcp-registry.stderr.log", "Проверка MCP registry"),
     JobLogSource("mcp.auth.stderr", "preflight.mcp-auth-env.stderr.log", "Проверка MCP auth environment"),
     JobLogSource("mcp.url.stderr", "preflight.mcp-url-env.stderr.log", "Проверка MCP URL environment"),
